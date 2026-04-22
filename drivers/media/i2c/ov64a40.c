@@ -113,6 +113,17 @@
 #define OV64A40_REG_SMIA		CCI_REG8(0x0100)
 #define OV64A40_REG_SMIA_STREAMING	BIT(0)
 
+/*
+ * MIPI lane-count select. 0x480c[4] is the manual-override enable bit, and
+ * 0x480c[3:0] is the lane count. The default 2-lane value used across every
+ * mode table is 0x92 (clk_lane_swap=100b in bits[7:5], manual-enable set,
+ * 2 lanes). For 4-lane operation only bits[3:0] change: 0x94 selects four
+ * lanes while preserving the other fields.
+ */
+#define OV64A40_REG_MIPI_LANE_CTRL	CCI_REG8(0x480c)
+#define OV64A40_MIPI_LANE_CTRL_2L	0x92
+#define OV64A40_MIPI_LANE_CTRL_4L	0x94
+
 enum ov64a40_link_freq_ids {
 	OV64A40_LINK_FREQ_456M_ID,
 	OV64A40_LINK_FREQ_360M_ID,
@@ -2847,6 +2858,8 @@ struct ov64a40 {
 	s64 *link_frequencies;
 	unsigned int num_link_frequencies;
 
+	unsigned int num_data_lanes;
+
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *link_freq;
@@ -2953,6 +2966,18 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 
 	ret = cci_multi_reg_write(ov64a40->cci, reglist->regvals,
 				  reglist->num_regs, NULL);
+	if (ret)
+		goto error_power_off;
+
+	/*
+	 * Per-mode register lists set 0x480c to the 2-lane value; override
+	 * here with the lane count declared in device tree.
+	 */
+	ret = cci_write(ov64a40->cci, OV64A40_REG_MIPI_LANE_CTRL,
+			ov64a40->num_data_lanes == 4
+				? OV64A40_MIPI_LANE_CTRL_4L
+				: OV64A40_MIPI_LANE_CTRL_2L,
+			NULL);
 	if (ret)
 		goto error_power_off;
 
@@ -3354,15 +3379,22 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 	struct v4l2_ctrl_handler *hdlr = &ov64a40->ctrl_handler;
 	struct v4l2_fwnode_device_properties props;
 	const struct ov64a40_timings *timings;
+	s64 pixel_rate;
 	int ret;
 
 	ret = v4l2_ctrl_handler_init(hdlr, 11);
 	if (ret)
 		return ret;
 
+	/*
+	 * CSI-2 output pixel rate scales linearly with lane count. The 2-lane
+	 * baseline (OV64A40_PIXEL_RATE) is preserved so that existing 2-lane
+	 * device-trees see no change in the advertised rate.
+	 */
+	pixel_rate = (s64)OV64A40_PIXEL_RATE * ov64a40->num_data_lanes / 2;
+
 	v4l2_ctrl_new_std(hdlr, &ov64a40_ctrl_ops, V4L2_CID_PIXEL_RATE,
-			  OV64A40_PIXEL_RATE, OV64A40_PIXEL_RATE,  1,
-			  OV64A40_PIXEL_RATE);
+			  pixel_rate, pixel_rate, 1, pixel_rate);
 
 	ov64a40->link_freq =
 		v4l2_ctrl_new_int_menu(hdlr, &ov64a40_ctrl_ops,
@@ -3477,7 +3509,13 @@ static int ov64a40_parse_dt(struct ov64a40 *ov64a40)
 		return ret;
 	}
 
-	if (v4l2_fwnode.bus.mipi_csi2.num_data_lanes != 2) {
+	switch (v4l2_fwnode.bus.mipi_csi2.num_data_lanes) {
+	case 2:
+	case 4:
+		ov64a40->num_data_lanes =
+			v4l2_fwnode.bus.mipi_csi2.num_data_lanes;
+		break;
+	default:
 		dev_err(ov64a40->dev, "Unsupported number of data lanes: %u\n",
 			v4l2_fwnode.bus.mipi_csi2.num_data_lanes);
 		v4l2_fwnode_endpoint_free(&v4l2_fwnode);
