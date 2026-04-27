@@ -3554,28 +3554,25 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 		/*
 		 * Sensor flips reverse the array readout order. In stagger
 		 * HDR that scrambles the L/M/S row interleave; in 4-cell HDR
-		 * it scrambles the per-cell exposure assignments. The safe
-		 * path is to refuse sensor flips while HDR is active and
-		 * rely on PiSP-side flip after the ISP.
+		 * it scrambles the per-cell exposure assignments. While HDR
+		 * is active we silently skip the write and rely on PiSP-side
+		 * flip after the ISP. We cannot return an error here because
+		 * __v4l2_ctrl_handler_setup() walks every control at
+		 * stream-start, and an error would abort the walk and stop
+		 * the sensor from ever beginning to stream. The hflip/vflip
+		 * controls are grabbed in start_streaming so the user cannot
+		 * toggle them mid-stream.
 		 */
-		if (ov64a40->hdr_active) {
-			dev_dbg(ov64a40->dev,
-				"VFLIP refused: HDR is active\n");
-			ret = -EBUSY;
+		if (ov64a40->hdr_active)
 			break;
-		}
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				      OV64A40_TIMING_CTRL_20_VFLIP,
 				      ctrl->val << 2,
 				      NULL);
 		break;
 	case V4L2_CID_HFLIP:
-		if (ov64a40->hdr_active) {
-			dev_dbg(ov64a40->dev,
-				"HFLIP refused: HDR is active\n");
-			ret = -EBUSY;
+		if (ov64a40->hdr_active)
 			break;
-		}
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
 				      OV64A40_TIMING_CTRL_21_HFLIP,
 				      ctrl->val ? 0
