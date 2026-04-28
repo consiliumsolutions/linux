@@ -3017,9 +3017,11 @@ static int ov64a40_program_subsampling(struct ov64a40 *ov64a40)
 }
 
 /*
- * HDR helpers. Called from start_streaming after the per-mode reglist has
- * been written but before the geometry programming, so that any HDR-specific
- * register overrides take precedence over the mode defaults.
+ * HDR helpers. Called from start_streaming AFTER the per-mode reglist,
+ * geometry programming, and subsampling/binning programming have run. The
+ * subsampling step writes 0x3821[4] (HBIN_4C is the same bit as the
+ * subsampling HBIN flag), so it must be written before HDR; otherwise
+ * 4-cell HDR's HBIN_4C requirement is silently cleared.
  */
 
 static int ov64a40_validate_hdr_mode(struct ov64a40 *ov64a40)
@@ -3162,10 +3164,16 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 		goto error_power_off;
 
 	/*
-	 * Latch HDR state from the user-facing controls and program the
-	 * sensor's HDR enables. Done before the V4L2 ctrl-handler walk so
-	 * that when EXPOSURE is reapplied below, hdr_active is set and the
-	 * s_ctrl handler will write the L/M/S exposure trio.
+	 * Latch HDR state from the user-facing controls. The actual HDR
+	 * register programming has to run AFTER program_subsampling, because
+	 * 4-cell HDR sets 0x3821[4] = HBIN_4C and program_subsampling also
+	 * writes that bit (clearing it for non-binned modes); running HDR
+	 * first lets program_subsampling stomp on HBIN_4C and the on-chip
+	 * 4-cell combiner never engages.
+	 *
+	 * hdr_active is latched here (before the V4L2 ctrl-handler walk) so
+	 * that when EXPOSURE is reapplied below, the s_ctrl handler writes
+	 * the L/M/S exposure trio.
 	 */
 	ov64a40->hdr_active = ov64a40->hdr_enable->val;
 	ov64a40->active_hdr_mode = ov64a40->hdr_mode->val;
@@ -3174,15 +3182,15 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 	if (ret)
 		goto error_power_off;
 
-	ret = ov64a40_program_hdr(ov64a40);
-	if (ret)
-		goto error_power_off;
-
 	ret = ov64a40_program_geometry(ov64a40);
 	if (ret)
 		goto error_power_off;
 
 	ret = ov64a40_program_subsampling(ov64a40);
+	if (ret)
+		goto error_power_off;
+
+	ret = ov64a40_program_hdr(ov64a40);
 	if (ret)
 		goto error_power_off;
 
