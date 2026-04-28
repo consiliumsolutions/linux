@@ -113,6 +113,78 @@
 #define OV64A40_REG_SMIA		CCI_REG8(0x0100)
 #define OV64A40_REG_SMIA_STREAMING	BIT(0)
 
+/*
+ * HDR control. The OV64A40 supports four sensor-side HDR modes which we
+ * expose via a vendor menu control:
+ *
+ *   4-cell      : 3-exposure 4-cell HDR. On-chip combine. Resolution-locked
+ *                 to 4624x3472 because the 4-cell pattern halves each axis.
+ *   2-exp-lm    : 2-exposure stagger HDR using long + medium readouts.
+ *   2-exp-dcg   : 2-exposure HDR using dual conversion gain (DCG + VS).
+ *   3-exp       : 3-exposure stagger HDR (gated, returns -EOPNOTSUPP until
+ *                 PiSP 3-stream stagger ingest is verified).
+ *
+ * Stagger HDR bit arrangement spans three timing-control registers:
+ *   0x3820[3] = hdr_3expo_en  (3-exposure format)
+ *   0x3821[5] = hdr_2expo_en  (2-exposure format)
+ *   0x3823[7] = stg_hdr_en    (stagger readout master enable)
+ *   0x3823[6] = stg_hdr_num   (0 = 2-exp, 1 = 3-exp)
+ *   0x3823[2] = four_cell_en  (4-cell HDR, default-on)
+ *   0x3823[1] = dcg_en        (dual conversion gain)
+ *   0x3821[4] = hbin_4c       (4-cell horizontal binning, required for
+ *                              4-cell HDR's half-resolution output)
+ */
+#define OV64A40_REG_TIMING_CTRL_23		CCI_REG8(0x3823)
+#define OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN	BIT(3)
+#define OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN	BIT(5)
+#define OV64A40_TIMING_CTRL_21_HBIN_4C		BIT(4)
+#define OV64A40_TIMING_CTRL_23_STG_HDR_EN	BIT(7)
+#define OV64A40_TIMING_CTRL_23_STG_HDR_NUM	BIT(6)
+#define OV64A40_TIMING_CTRL_23_FOUR_CELL_EN	BIT(2)
+#define OV64A40_TIMING_CTRL_23_DCG_EN		BIT(1)
+
+/*
+ * Per-exposure timing and gain registers. The long-exposure registers
+ * already exist above as OV64A40_REG_MEC_LONG_EXPO/_GAIN; medium and short
+ * are added here for HDR.
+ */
+#define OV64A40_REG_MEC_MEDIUM_EXPO	CCI_REG24(0x3540)
+#define OV64A40_REG_MEC_MEDIUM_GAIN	CCI_REG16(0x3548)
+#define OV64A40_REG_MEC_SHORT_EXPO	CCI_REG24(0x3580)
+#define OV64A40_REG_MEC_SHORT_GAIN	CCI_REG16(0x3588)
+
+/* Long->Medium and Medium->Short row distances for stagger HDR. */
+#define OV64A40_REG_LM_DISTANCE_MAN	CCI_REG24(0x3850)
+#define OV64A40_REG_MS_DISTANCE_MAN	CCI_REG24(0x3853)
+
+/*
+ * Fixed exposure ratio between adjacent exposures in HDR modes, mirroring
+ * the convention used by the IMX708 Pi sensor. Long:Medium = Medium:Short
+ * = OV64A40_HDR_EXPOSURE_RATIO. The user sets the long exposure via
+ * V4L2_CID_EXPOSURE; the medium and short are derived automatically.
+ */
+#define OV64A40_HDR_EXPOSURE_RATIO	4
+
+/*
+ * Vendor menu control for selecting which sensor HDR mode is active when
+ * V4L2_CID_WIDE_DYNAMIC_RANGE is set.
+ */
+#define V4L2_CID_OV64A40_HDR_MODE	(V4L2_CID_USER_BASE + 0x1080)
+
+enum ov64a40_hdr_mode {
+	OV64A40_HDR_MODE_4CELL = 0,
+	OV64A40_HDR_MODE_2EXP_LM = 1,
+	OV64A40_HDR_MODE_2EXP_DCG = 2,
+	OV64A40_HDR_MODE_3EXP = 3,
+};
+
+static const char * const ov64a40_hdr_mode_menu[] = {
+	"4-cell",
+	"2-exp-lm",
+	"2-exp-dcg",
+	"3-exp",
+};
+
 enum ov64a40_link_freq_ids {
 	OV64A40_LINK_FREQ_456M_ID,
 	OV64A40_LINK_FREQ_360M_ID,
@@ -2854,6 +2926,16 @@ struct ov64a40 {
 	struct v4l2_ctrl *hblank;
 	struct v4l2_ctrl *vflip;
 	struct v4l2_ctrl *hflip;
+	struct v4l2_ctrl *hdr_enable;
+	struct v4l2_ctrl *hdr_mode;
+
+	/*
+	 * Latched HDR state, updated at stream-start from hdr_enable and
+	 * hdr_mode. The s_ctrl handlers for EXPOSURE / HFLIP / VFLIP read
+	 * these to decide on per-exposure trio writes and on flip gating.
+	 */
+	bool hdr_active;
+	enum ov64a40_hdr_mode active_hdr_mode;
 };
 
 static inline struct ov64a40 *sd_to_ov64a40(struct v4l2_subdev *sd)
@@ -2934,6 +3016,131 @@ static int ov64a40_program_subsampling(struct ov64a40 *ov64a40)
 	return ret;
 }
 
+/*
+ * HDR helpers. Called from start_streaming AFTER the per-mode reglist,
+ * geometry programming, and subsampling/binning programming have run. The
+ * subsampling step writes 0x3821[4] (HBIN_4C is the same bit as the
+ * subsampling HBIN flag), so it must be written before HDR; otherwise
+ * 4-cell HDR's HBIN_4C requirement is silently cleared.
+ */
+
+static int ov64a40_validate_hdr_mode(struct ov64a40 *ov64a40)
+{
+	if (!ov64a40->hdr_enable->val)
+		return 0;
+
+	switch (ov64a40->hdr_mode->val) {
+	case OV64A40_HDR_MODE_4CELL:
+		if (ov64a40->mode->width != 4624 ||
+		    ov64a40->mode->height != 3472) {
+			dev_err(ov64a40->dev,
+				"4-cell HDR is only available at 4624x3472 (have %ux%u)\n",
+				ov64a40->mode->width, ov64a40->mode->height);
+			return -EINVAL;
+		}
+		return 0;
+
+	case OV64A40_HDR_MODE_2EXP_LM:
+	case OV64A40_HDR_MODE_2EXP_DCG:
+		return 0;
+
+	case OV64A40_HDR_MODE_3EXP:
+		dev_warn(ov64a40->dev,
+			 "3-exposure HDR is not yet supported on this platform\n");
+		return -EOPNOTSUPP;
+	}
+
+	return -EINVAL;
+}
+
+static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
+{
+	int ret = 0;
+
+	if (!ov64a40->hdr_active) {
+		/*
+		 * Clear all HDR enable bits. four_cell_en (bit 2 of 0x3823)
+		 * is left at its power-on default since it reflects the
+		 * physical pixel layout rather than an active HDR mode.
+		 */
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
+				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
+				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN, 0, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
+				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
+				OV64A40_TIMING_CTRL_23_DCG_EN, 0, &ret);
+		return ret;
+	}
+
+	switch (ov64a40->active_hdr_mode) {
+	case OV64A40_HDR_MODE_4CELL:
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
+				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN,
+				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
+				OV64A40_TIMING_CTRL_21_HBIN_4C |
+				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN,
+				OV64A40_TIMING_CTRL_21_HBIN_4C, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
+				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
+				OV64A40_TIMING_CTRL_23_DCG_EN |
+				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN,
+				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN, &ret);
+		break;
+
+	case OV64A40_HDR_MODE_2EXP_LM:
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
+				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
+				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN,
+				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
+				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
+				OV64A40_TIMING_CTRL_23_STG_HDR_NUM |
+				OV64A40_TIMING_CTRL_23_DCG_EN,
+				OV64A40_TIMING_CTRL_23_STG_HDR_EN, &ret);
+		break;
+
+	case OV64A40_HDR_MODE_2EXP_DCG:
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
+				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
+				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN, 0, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
+				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
+				OV64A40_TIMING_CTRL_23_DCG_EN,
+				OV64A40_TIMING_CTRL_23_DCG_EN, &ret);
+		break;
+
+	case OV64A40_HDR_MODE_3EXP:
+		/* Caller already rejected via ov64a40_validate_hdr_mode(). */
+		return -EOPNOTSUPP;
+	}
+
+	return ret;
+}
+
+/*
+ * Compute and program the medium and short exposures for stagger HDR. The
+ * long exposure is left untouched here -- callers program it via the
+ * existing OV64A40_REG_MEC_LONG_EXPO path. The medium/short values are
+ * derived from the long via OV64A40_HDR_EXPOSURE_RATIO and clamped to the
+ * sensor minimum.
+ */
+static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exp_long)
+{
+	int exp_med = max_t(int, exp_long / OV64A40_HDR_EXPOSURE_RATIO,
+			    OV64A40_EXPOSURE_MIN);
+	int exp_short = max_t(int, exp_med / OV64A40_HDR_EXPOSURE_RATIO,
+			      OV64A40_EXPOSURE_MIN);
+	int ret = 0;
+
+	cci_write(ov64a40->cci, OV64A40_REG_MEC_MEDIUM_EXPO, exp_med, &ret);
+	cci_write(ov64a40->cci, OV64A40_REG_MEC_SHORT_EXPO, exp_short, &ret);
+	return ret;
+}
+
 static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 				   struct v4l2_subdev_state *state)
 {
@@ -2956,11 +3163,34 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 	if (ret)
 		goto error_power_off;
 
+	/*
+	 * Latch HDR state from the user-facing controls. The actual HDR
+	 * register programming has to run AFTER program_subsampling, because
+	 * 4-cell HDR sets 0x3821[4] = HBIN_4C and program_subsampling also
+	 * writes that bit (clearing it for non-binned modes); running HDR
+	 * first lets program_subsampling stomp on HBIN_4C and the on-chip
+	 * 4-cell combiner never engages.
+	 *
+	 * hdr_active is latched here (before the V4L2 ctrl-handler walk) so
+	 * that when EXPOSURE is reapplied below, the s_ctrl handler writes
+	 * the L/M/S exposure trio.
+	 */
+	ov64a40->hdr_active = ov64a40->hdr_enable->val;
+	ov64a40->active_hdr_mode = ov64a40->hdr_mode->val;
+
+	ret = ov64a40_validate_hdr_mode(ov64a40);
+	if (ret)
+		goto error_power_off;
+
 	ret = ov64a40_program_geometry(ov64a40);
 	if (ret)
 		goto error_power_off;
 
 	ret = ov64a40_program_subsampling(ov64a40);
+	if (ret)
+		goto error_power_off;
+
+	ret = ov64a40_program_hdr(ov64a40);
 	if (ret)
 		goto error_power_off;
 
@@ -2973,10 +3203,12 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 	if (ret)
 		goto error_power_off;
 
-	/* Link frequency and flips cannot change while streaming. */
+	/* Link frequency, flips, and HDR mode cannot change while streaming. */
 	__v4l2_ctrl_grab(ov64a40->link_freq, true);
 	__v4l2_ctrl_grab(ov64a40->vflip, true);
 	__v4l2_ctrl_grab(ov64a40->hflip, true);
+	__v4l2_ctrl_grab(ov64a40->hdr_enable, true);
+	__v4l2_ctrl_grab(ov64a40->hdr_mode, true);
 
 	/* delay: max(4096 xclk pulses, 150usec) + exposure time */
 	timings = ov64a40_get_timings(ov64a40, ov64a40->link_freq->cur.val);
@@ -3007,6 +3239,10 @@ static int ov64a40_stop_streaming(struct ov64a40 *ov64a40,
 	__v4l2_ctrl_grab(ov64a40->link_freq, false);
 	__v4l2_ctrl_grab(ov64a40->vflip, false);
 	__v4l2_ctrl_grab(ov64a40->hflip, false);
+	__v4l2_ctrl_grab(ov64a40->hdr_enable, false);
+	__v4l2_ctrl_grab(ov64a40->hdr_mode, false);
+
+	ov64a40->hdr_active = false;
 
 	return 0;
 }
@@ -3293,6 +3529,18 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
+		/*
+		 * In stagger HDR modes, the user's exposure value drives the
+		 * long-exposure register; medium and short are derived from
+		 * it via OV64A40_HDR_EXPOSURE_RATIO. 4-cell HDR uses the same
+		 * trio because all three exposures are present per pixel
+		 * within the 4-cell pattern, on-chip combined.
+		 */
+		if (ov64a40->hdr_active) {
+			ret = ov64a40_program_hdr_exposures(ov64a40, ctrl->val);
+			if (ret)
+				break;
+		}
 		ret = cci_write(ov64a40->cci, OV64A40_REG_MEC_LONG_EXPO,
 				ctrl->val, NULL);
 		break;
@@ -3311,12 +3559,28 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 	case V4L2_CID_VFLIP:
+		/*
+		 * Sensor flips reverse the array readout order. In stagger
+		 * HDR that scrambles the L/M/S row interleave; in 4-cell HDR
+		 * it scrambles the per-cell exposure assignments. While HDR
+		 * is active we silently skip the write and rely on PiSP-side
+		 * flip after the ISP. We cannot return an error here because
+		 * __v4l2_ctrl_handler_setup() walks every control at
+		 * stream-start, and an error would abort the walk and stop
+		 * the sensor from ever beginning to stream. The hflip/vflip
+		 * controls are grabbed in start_streaming so the user cannot
+		 * toggle them mid-stream.
+		 */
+		if (ov64a40->hdr_active)
+			break;
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				      OV64A40_TIMING_CTRL_20_VFLIP,
 				      ctrl->val << 2,
 				      NULL);
 		break;
 	case V4L2_CID_HFLIP:
+		if (ov64a40->hdr_active)
+			break;
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
 				      OV64A40_TIMING_CTRL_21_HFLIP,
 				      ctrl->val ? 0
@@ -3329,6 +3593,16 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_LINK_FREQ:
 		ret = ov64a40_link_freq_config(ov64a40, ctrl->val);
+		break;
+	case V4L2_CID_WIDE_DYNAMIC_RANGE:
+	case V4L2_CID_OV64A40_HDR_MODE:
+		/*
+		 * HDR controls are latched; the actual register programming
+		 * happens at stream-start (start_streaming -> program_hdr).
+		 * Both controls are grabbed during streaming so the user
+		 * cannot toggle them mid-stream.
+		 */
+		ret = 0;
 		break;
 	default:
 		dev_err(ov64a40->dev, "Unhandled control: %#x\n", ctrl->id);
@@ -3356,7 +3630,8 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 	const struct ov64a40_timings *timings;
 	int ret;
 
-	ret = v4l2_ctrl_handler_init(hdlr, 11);
+	/* +2 for the HDR enable / mode controls. */
+	ret = v4l2_ctrl_handler_init(hdlr, 13);
 	if (ret)
 		return ret;
 
@@ -3408,6 +3683,34 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 					   V4L2_CID_VFLIP, 0, 1, 1, 0);
 	if (ov64a40->vflip)
 		ov64a40->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+
+	/*
+	 * HDR enable + mode selector. The standard V4L2_CID_WIDE_DYNAMIC_RANGE
+	 * boolean is the master switch (compatible with rpicam-apps' existing
+	 * --hdr sensor flag and any other libcamera client that consults it).
+	 * The vendor-specific OV64A40 menu selects which sensor HDR mode is
+	 * active when WIDE_DYNAMIC_RANGE is set; default is 2-exp-lm to
+	 * mirror the IMX708 stagger HDR convention.
+	 */
+	ov64a40->hdr_enable = v4l2_ctrl_new_std(hdlr, &ov64a40_ctrl_ops,
+						V4L2_CID_WIDE_DYNAMIC_RANGE,
+						0, 1, 1, 0);
+
+	{
+		static const struct v4l2_ctrl_config ov64a40_hdr_mode_cfg = {
+			.ops = &ov64a40_ctrl_ops,
+			.id = V4L2_CID_OV64A40_HDR_MODE,
+			.name = "OV64A40 HDR Mode",
+			.type = V4L2_CTRL_TYPE_MENU,
+			.min = 0,
+			.max = ARRAY_SIZE(ov64a40_hdr_mode_menu) - 1,
+			.def = OV64A40_HDR_MODE_2EXP_LM,
+			.qmenu = ov64a40_hdr_mode_menu,
+		};
+
+		ov64a40->hdr_mode =
+			v4l2_ctrl_new_custom(hdlr, &ov64a40_hdr_mode_cfg, NULL);
+	}
 
 	if (hdlr->error) {
 		ret = hdlr->error;
