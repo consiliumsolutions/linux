@@ -126,18 +126,19 @@
  *
  *   4-cell      : 3-exposure 4-cell HDR. On-chip combine. Resolution-locked
  *                 to 4624x3472 because the 4-cell pattern halves each axis.
- *   2-exp-lm    : 2-exposure stagger HDR using long + medium readouts.
+ *   2-exp-lm    : 2-exposure stagger HDR (long + second exposure), output
+ *                 uncombined as one interleaved frame of twice the height,
+ *                 see ov64a40_stagger_hdr_mode. Experimental: only offered
+ *                 when the experimental_hdr module parameter is set.
  *   2-exp-dcg   : 2-exposure HDR using dual conversion gain (DCG + VS).
- *   3-exp       : 3-exposure stagger HDR (gated, returns -EOPNOTSUPP until
- *                 PiSP 3-stream stagger ingest is verified).
- *
- * The 2-exp-lm, 2-exp-dcg and 3-exp modes do not produce frames on hardware
- * yet. They are experimental and hidden from the menu unless the
- * experimental_hdr module parameter is set.
+ *                 Does not produce frames, always hidden from the menu.
+ *   3-exp       : 3-exposure stagger HDR. Not supported, always hidden.
  *
  * Stagger HDR bit arrangement spans three timing-control registers:
  *   0x3820[3] = hdr_3expo_en  (3-exposure format)
- *   0x3821[5] = hdr_2expo_en  (2-exposure format)
+ *   0x3821[5] = hdr_2expo_en  (2-exposure on-chip combine work mode; must
+ *                              stay clear for the uncombined 2-exp-lm
+ *                              stagger output)
  *   0x3823[7] = stg_hdr_en    (stagger readout master enable)
  *   0x3823[6] = stg_hdr_num   (0 = 2-exp, 1 = 3-exp)
  *   0x3823[2] = four_cell_en  (set by the init list, left set in all modes)
@@ -175,6 +176,11 @@
 #define OV64A40_REG_MIPI_VC_SEL_PD		CCI_REG8(0x4836)
 #define OV64A40_MIPI_VC_SEL_PD_DEFAULT		0x32
 #define OV64A40_MIPI_VC_SEL_PD_VC0		0x02
+#define OV64A40_MIPI_VC_SEL_PD_STAGGER		0x00
+/* [7:4]: virtual channel of the second image stream (stagger exposure). */
+#define OV64A40_REG_MIPI_VC_SEL			CCI_REG8(0x4813)
+#define OV64A40_MIPI_VC_SEL_DEFAULT		0x10
+#define OV64A40_MIPI_VC_SEL_STAGGER		0x00
 /* [7:6]: line skip mode. */
 #define OV64A40_REG_PRE_PIPE_TOP_2		CCI_REG8(0x5002)
 #define OV64A40_PRE_PIPE_TOP_2_4CELL_HDR	0x35
@@ -190,6 +196,37 @@
 #define OV64A40_REG_BLC_L_CTRL_18		CCI_REG8(0x4018)
 #define OV64A40_BLC_BL_END_HDR			0x0f
 #define OV64A40_BLC_L_CTRL_18_HDR		0x03
+/* Second (0x49xx) and third (0x4axx) exposure black level blocks. */
+#define OV64A40_REG_BLC_S_BL_START		CCI_REG8(0x4915)
+#define OV64A40_REG_BLC_S_BL_END		CCI_REG8(0x4916)
+#define OV64A40_REG_BLC_VS_BL_START		CCI_REG8(0x4a15)
+#define OV64A40_REG_BLC_VS_BL_END		CCI_REG8(0x4a16)
+
+/* Stagger HDR readout and timing registers, see ov64a40_stagger_hdr_regs[]. */
+#define OV64A40_REG_TIMING_CTRL_22		CCI_REG8(0x3822)
+#define OV64A40_REG_TIMING_CTRL_2E		CCI_REG8(0x382e)
+#define OV64A40_REG_TIMING_CTRL_94		CCI_REG8(0x3894)
+#define OV64A40_REG_HTS_S			CCI_REG16(0x384c)
+#define OV64A40_REG_SNR_SYNC_4			CCI_REG8(0x4504)
+#define OV64A40_REG_SRAM_CTRL_45CB		CCI_REG8(0x45cb)
+#define OV64A40_REG_VFIFO_CTRL_B		CCI_REG8(0x460b)
+#define OV64A40_REG_PRE_PIPE_TOP_1		CCI_REG8(0x5001)
+
+/*
+ * Stagger HDR timing, in sensor rows. One stagger row period is two line
+ * periods (HTS) and carries one line of each exposure; VTS counts rows per
+ * exposure. Measured on hardware: the second exposure's rows start
+ * (second exposure + about 18) rows after the long exposure's, and VTS
+ * must cover the output height plus that offset, otherwise rows are lost
+ * and the sensor output FIFO overflows. OV64A40_STAGGER_VTS_MARGIN is the
+ * margin kept on top; OV64A40_STAGGER_EXPOSURE_MARGIN bounds the sum of
+ * both exposures as in the vendor reference settings.
+ */
+#define OV64A40_STAGGER_ROW_LINES		2
+#define OV64A40_STAGGER_OFFSET_EXTRA		18
+#define OV64A40_STAGGER_VTS_MARGIN		72
+#define OV64A40_STAGGER_EXPOSURE_MARGIN		72
+#define OV64A40_STAGGER_EXPOSURE_STEP		2
 
 /* Long->Medium and Medium->Short row distances for stagger HDR. */
 #define OV64A40_REG_LM_DISTANCE_MAN	CCI_REG24(0x3850)
@@ -223,8 +260,10 @@ static const char * const ov64a40_hdr_mode_menu[] = {
 	"3-exp",
 };
 
-#define OV64A40_HDR_MODES_EXPERIMENTAL	(BIT_ULL(OV64A40_HDR_MODE_2EXP_LM) | \
-					 BIT_ULL(OV64A40_HDR_MODE_2EXP_DCG) | \
+/* Offered only with the experimental_hdr module parameter. */
+#define OV64A40_HDR_MODES_EXPERIMENTAL	BIT_ULL(OV64A40_HDR_MODE_2EXP_LM)
+/* Never offered: no frames on hardware. */
+#define OV64A40_HDR_MODES_UNSUPPORTED	(BIT_ULL(OV64A40_HDR_MODE_2EXP_DCG) | \
 					 BIT_ULL(OV64A40_HDR_MODE_3EXP))
 
 static bool hdr_group_hold = true;
@@ -235,7 +274,7 @@ MODULE_PARM_DESC(hdr_group_hold,
 static bool experimental_hdr;
 module_param(experimental_hdr, bool, 0444);
 MODULE_PARM_DESC(experimental_hdr,
-		 "Offer the stagger and DCG HDR modes, which do not produce frames yet (default: off)");
+		 "Offer 2-exp-lm stagger HDR and its 4624x6944 interleaved format (default: off)");
 
 enum ov64a40_link_freq_ids {
 	OV64A40_LINK_FREQ_456M_ID,
@@ -2703,13 +2742,60 @@ static const struct cci_reg_sequence ov64a40_4cell_hdr_regs[] = {
 };
 
 /*
- * Non-HDR values of the ov64a40_4cell_hdr_regs[] registers that ov64a40_init
- * does not rewrite on every stream start. 0x3684, 0x4016, 0x4018, 0x5002,
- * 0x5066/0x5067, 0x6801 and 0x6802 are restored by ov64a40_init and the
- * per-mode register lists (some of which set 0x4016, 0x4018 and 0x5002
- * themselves), 0x3812/0x3813 by ov64a40_program_geometry().
+ * 2-exp-lm stagger HDR settings, written by ov64a40_program_hdr() on top of
+ * the 4624x3472 register list, the geometry and subsampling of
+ * ov64a40_stagger_hdr_mode and the stagger enable in 0x3823. All measured
+ * on hardware (both sensors, one standby from the plain 4624x3472 stream):
+ *
+ * - Readout: increments 1/1 (subsampling), 4-cell horizontal binning with
+ *   double speed in 0x3821, no digital horizontal subsampling or binning
+ *   (0x4504) and no 4-cell to Bayer conversion (0x5001). The binned readout
+ *   of the plain mode never feeds the second exposure pipe correctly.
+ * - Stagger control (0x3894, 0x382e), SRAM and VFIFO control (0x45cb,
+ *   0x460b), no line skip (0x5002, as in 4-cell HDR) and PD control
+ *   (0x3684) as in the vendor reference stagger settings.
+ * - The second exposure is a separate logical image stream sent on VC1 by
+ *   default. Mapping it (0x4813) and the PD stream (0x4836) to VC0 makes
+ *   the receiver get both exposures, line-interleaved in Bayer row pairs,
+ *   in one frame on VC0.
+ * - The black level blocks of the second and third exposure never
+ *   calibrate with the black line window of the 4624x3472 list (raw
+ *   pedestal about 191 instead of 64 at 10 bits); the init values fix it.
+ *
+ * hts_s (0x384c/0x384d) must equal HTS, see ov64a40_program_hdr().
  */
-static const struct cci_reg_sequence ov64a40_4cell_hdr_off_regs[] = {
+static const struct cci_reg_sequence ov64a40_stagger_hdr_regs[] = {
+	{ OV64A40_REG_TIMING_CTRL_22, 0x00 },
+	{ OV64A40_REG_SNR_SYNC_4, 0x80 },
+	{ OV64A40_REG_PRE_PIPE_TOP_1, 0x01 },
+	{ OV64A40_REG_TIMING_CTRL_94, 0x03 },
+	{ OV64A40_REG_TIMING_CTRL_2E, 0x49 },
+	{ OV64A40_REG_SRAM_CTRL_45CB, 0x03 },
+	{ OV64A40_REG_VFIFO_CTRL_B, 0x02 },
+	{ OV64A40_REG_PRE_PIPE_TOP_2, OV64A40_PRE_PIPE_TOP_2_4CELL_HDR },
+	{ OV64A40_REG_PD_CTRL, 0x01 },
+	{ OV64A40_REG_MIPI_VC_SEL, OV64A40_MIPI_VC_SEL_STAGGER },
+	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_STAGGER },
+	{ OV64A40_REG_BLC_S_BL_START, 0x00 },
+	{ OV64A40_REG_BLC_S_BL_END, OV64A40_BLC_BL_END_HDR },
+	{ OV64A40_REG_BLC_VS_BL_START, 0x00 },
+	{ OV64A40_REG_BLC_VS_BL_END, OV64A40_BLC_BL_END_HDR },
+};
+
+/*
+ * Non-HDR values of the HDR registers that ov64a40_init does not rewrite on
+ * every stream start (0x4813, 0x4836). Everything else is restored without
+ * extra code: ov64a40_init starts with a software reset and rewrites 0x3684,
+ * 0x3822, 0x3823, 0x382e, 0x384c/0x384d, 0x3894, 0x4016, 0x4018, 0x4504,
+ * 0x45cb, 0x460b, 0x4915/0x4916, 0x4a15/0x4a16, 0x5002, 0x5066/0x5067,
+ * 0x6801 and 0x6802; the per-mode register lists then apply their own
+ * values (some set 0x3822, 0x384c/0x384d, 0x4016, 0x4018, 0x4504, 0x4915,
+ * 0x4916, 0x4a15, 0x4a16, 0x5001 and 0x5002 themselves), and
+ * ov64a40_program_geometry() and ov64a40_program_subsampling() write
+ * 0x3810-0x3815, 0x3820[1] and 0x3821[4,0] per mode.
+ */
+static const struct cci_reg_sequence ov64a40_hdr_off_regs[] = {
+	{ OV64A40_REG_MIPI_VC_SEL, OV64A40_MIPI_VC_SEL_DEFAULT },
 	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_DEFAULT },
 };
 
@@ -2755,6 +2841,11 @@ static struct ov64a40_mode {
 	struct ov64a40_subsampling subsampling;
 	/* Minimum VTS, if larger than height + OV64A40_VBLANK_MIN. */
 	unsigned int vts_min;
+	/*
+	 * Output lines per sensor row (VTS unit), 0 means 1. 2 in stagger
+	 * HDR, where each row carries one line of each exposure.
+	 */
+	unsigned int row_lines;
 } ov64a40_modes[] = {
 	/* Full resolution */
 	{
@@ -3061,6 +3152,70 @@ static const struct ov64a40_mode ov64a40_4cell_hdr_mode = {
 	.vts_min = 6944 + OV64A40_VBLANK_MIN,
 };
 
+/*
+ * 2-exp-lm stagger HDR, 4624x3472 per exposure, output as one 4624x6944
+ * frame on VC0 (see ov64a40_stagger_hdr_regs[]). Not listed in
+ * ov64a40_modes[]: it is offered as an extra frame size only when the
+ * experimental_hdr module parameter is set, and the frame size alone
+ * selects it.
+ *
+ * Measured row map: the first (second exposure + about 18) rows,
+ * 274 with the second exposure at 256 rows, carry only the long exposure,
+ * then the exposures alternate in Bayer row pairs, and the last rows of the
+ * frame carry only the second exposure. Each exposure has 3472 rows.
+ *
+ * Timing: one sensor row takes two line periods (HTS) and VTS counts rows
+ * per exposure, so a frame takes VTS x 2 x HTS. The controls describe the
+ * frame as 6944 lines of HTS: HBLANK is HTS - width as in every mode and
+ * height + VBLANK is 2 x VTS (VBLANK and EXPOSURE are in lines, i.e. half
+ * rows). Measured: VTS 3939 (3.5 fps at 360 MHz) is stable at 3472 lines
+ * per exposure, VTS 3660 is too short. The 456 MHz timings have not been
+ * run on hardware.
+ */
+static const struct ov64a40_mode ov64a40_stagger_hdr_mode = {
+	.width = 4624,
+	.height = 2 * 3472,
+	.timings_default = {
+		[OV64A40_LINK_FREQ_456M_ID] = {
+			.vts = 3939,
+			.ppl = 2112,
+		},
+		/* 3.5 FPS */
+		[OV64A40_LINK_FREQ_360M_ID] = {
+			.vts = 3939,
+			.ppl = 2720,
+		},
+	},
+	.reglist = {
+		.num_regs = ARRAY_SIZE(ov64a40_4624_3472),
+		.regvals = ov64a40_4624_3472,
+	},
+	.analogue_crop = {
+		.left = 0,
+		.top = 0,
+		.width = 9280,
+		.height = 6976,
+	},
+	/* Output window per exposure, as in the 4624x3472 mode. */
+	.digital_crop = {
+		.left = 9,
+		.top = 8,
+		.width = 4624,
+		.height = 3472,
+	},
+	/* 4-cell horizontal binning (hbin) instead of horizontal skipping. */
+	.subsampling = {
+		.x_odd_inc = 1,
+		.x_even_inc = 1,
+		.y_odd_inc = 1,
+		.y_even_inc = 1,
+		.vbin = true,
+		.hbin = true,
+	},
+	.vts_min = 3939,
+	.row_lines = OV64A40_STAGGER_ROW_LINES,
+};
+
 struct ov64a40 {
 	struct device *dev;
 
@@ -3069,11 +3224,12 @@ struct ov64a40 {
 
 	struct regmap *cci;
 
-	struct ov64a40_mode *mode;
+	const struct ov64a40_mode *mode;
 	/*
 	 * Mode programmed into the sensor: either mode, or a variant of it
 	 * selected by the HDR controls (ov64a40_4cell_hdr_mode). Timings and
-	 * control limits are derived from it.
+	 * control limits are derived from it. ov64a40_stagger_hdr_mode is
+	 * selected by its frame size and is both mode and sensor_mode.
 	 */
 	const struct ov64a40_mode *sensor_mode;
 
@@ -3120,10 +3276,64 @@ ov64a40_get_timings(struct ov64a40 *ov64a40, unsigned int link_freq_index)
 	return &ov64a40->sensor_mode->timings_default[timings_index];
 }
 
+static unsigned int ov64a40_row_lines(const struct ov64a40_mode *mode)
+{
+	return mode->row_lines ?: 1;
+}
+
+static bool ov64a40_is_stagger(const struct ov64a40_mode *mode)
+{
+	return mode == &ov64a40_stagger_hdr_mode;
+}
+
 static unsigned int ov64a40_vblank_min(const struct ov64a40_mode *mode)
 {
-	return max(mode->vts_min, mode->height + OV64A40_VBLANK_MIN) -
-	       mode->height;
+	return max(mode->vts_min * ov64a40_row_lines(mode),
+		   mode->height + OV64A40_VBLANK_MIN) - mode->height;
+}
+
+/*
+ * Exposure control range and step. In stagger HDR the control is in lines
+ * (half rows) and the exposures are programmed in even numbers of rows.
+ */
+static int ov64a40_exposure_min(const struct ov64a40_mode *mode)
+{
+	return OV64A40_EXPOSURE_MIN * ov64a40_row_lines(mode);
+}
+
+static int ov64a40_exposure_step(const struct ov64a40_mode *mode)
+{
+	if (!ov64a40_is_stagger(mode))
+		return 1;
+
+	return OV64A40_STAGGER_EXPOSURE_STEP * OV64A40_STAGGER_ROW_LINES;
+}
+
+/*
+ * Maximum exposure for a vertical blanking value. In stagger HDR the
+ * second exposure (long / OV64A40_HDR_EXPOSURE_RATIO) must leave
+ * VTS >= output height + second exposure + OV64A40_STAGGER_OFFSET_EXTRA +
+ * OV64A40_STAGGER_VTS_MARGIN, and long + second exposure +
+ * OV64A40_STAGGER_EXPOSURE_MARGIN must not exceed VTS.
+ */
+static int ov64a40_exposure_max(const struct ov64a40_mode *mode, int vblank)
+{
+	int vts, med_max, long_max;
+
+	if (!ov64a40_is_stagger(mode))
+		return mode->height + vblank - OV64A40_EXPOSURE_MARGIN;
+
+	vts = (mode->height + vblank) / OV64A40_STAGGER_ROW_LINES;
+	med_max = vts - (int)mode->digital_crop.height -
+		  OV64A40_STAGGER_OFFSET_EXTRA - OV64A40_STAGGER_VTS_MARGIN;
+	long_max = min(med_max * OV64A40_HDR_EXPOSURE_RATIO,
+		       (vts - OV64A40_STAGGER_EXPOSURE_MARGIN) *
+		       OV64A40_HDR_EXPOSURE_RATIO /
+		       (OV64A40_HDR_EXPOSURE_RATIO + 1));
+	long_max = rounddown(max(long_max, OV64A40_EXPOSURE_MIN),
+			     OV64A40_STAGGER_EXPOSURE_STEP);
+
+	return long_max * OV64A40_STAGGER_ROW_LINES;
 }
 
 static const struct ov64a40_mode *
@@ -3131,6 +3341,10 @@ ov64a40_find_sensor_mode(struct ov64a40 *ov64a40, bool hdr_enable,
 			 s32 hdr_mode)
 {
 	const struct ov64a40_mode *hdr = &ov64a40_4cell_hdr_mode;
+
+	/* The stagger frame size always streams stagger HDR. */
+	if (ov64a40_is_stagger(ov64a40->mode))
+		return ov64a40->mode;
 
 	if (hdr_enable && hdr_mode == OV64A40_HDR_MODE_4CELL &&
 	    ov64a40->mode->width == hdr->width &&
@@ -3144,22 +3358,25 @@ ov64a40_find_sensor_mode(struct ov64a40 *ov64a40, bool hdr_enable,
 static void ov64a40_update_ctrl_limits(struct ov64a40 *ov64a40)
 {
 	const struct ov64a40_mode *mode = ov64a40->sensor_mode;
+	unsigned int row_lines = ov64a40_row_lines(mode);
 	const struct ov64a40_timings *timings;
 	int vblank_max, vblank_def;
 	int hblank_val;
 	int exp_max;
 
+	/* VBLANK steps by whole sensor rows (VTS units). */
 	timings = ov64a40_get_timings(ov64a40, ov64a40->link_freq->cur.val);
-	vblank_max = OV64A40_VTS_MAX - mode->height;
-	vblank_def = timings->vts - mode->height;
+	vblank_max = rounddown(OV64A40_VTS_MAX, row_lines) - mode->height;
+	vblank_def = timings->vts * row_lines - mode->height;
 	__v4l2_ctrl_modify_range(ov64a40->vblank, ov64a40_vblank_min(mode),
-				 vblank_max, 1, vblank_def);
+				 vblank_max, row_lines, vblank_def);
 	__v4l2_ctrl_s_ctrl(ov64a40->vblank, vblank_def);
 
-	exp_max = timings->vts - OV64A40_EXPOSURE_MARGIN;
+	exp_max = ov64a40_exposure_max(mode, vblank_def);
 	__v4l2_ctrl_modify_range(ov64a40->exposure,
-				 OV64A40_EXPOSURE_MIN, exp_max,
-				 1, OV64A40_EXPOSURE_MIN);
+				 ov64a40_exposure_min(mode), exp_max,
+				 ov64a40_exposure_step(mode),
+				 ov64a40_exposure_min(mode));
 
 	hblank_val = timings->ppl * 4 - mode->width;
 	__v4l2_ctrl_modify_range(ov64a40->hblank,
@@ -3253,24 +3470,28 @@ static int ov64a40_validate_hdr_mode(struct ov64a40 *ov64a40)
 		return 0;
 
 	case OV64A40_HDR_MODE_2EXP_LM:
-	case OV64A40_HDR_MODE_2EXP_DCG:
 		/*
-		 * Hidden from the menu unless experimental_hdr is set; checked
-		 * again here so that the rejection is visible in the log.
+		 * The stagger frame size streams stagger HDR without coming
+		 * here (see ov64a40_start_streaming()): any other size cannot
+		 * carry both exposures.
 		 */
 		if (!experimental_hdr) {
 			dev_warn(ov64a40->dev,
-				 "%s HDR does not produce frames yet; load with experimental_hdr=1 to try it\n",
-				 ov64a40_hdr_mode_menu[ov64a40->hdr_mode->val]);
+				 "2-exp-lm HDR is experimental; load with experimental_hdr=1 to try it\n");
 			return -EOPNOTSUPP;
 		}
-		dev_warn(ov64a40->dev, "%s HDR is experimental\n",
-			 ov64a40_hdr_mode_menu[ov64a40->hdr_mode->val]);
-		return 0;
-
-	case OV64A40_HDR_MODE_3EXP:
 		dev_warn(ov64a40->dev,
-			 "3-exposure HDR is not yet supported on this platform\n");
+			 "2-exp-lm HDR needs the %ux%u frame size (have %ux%u)\n",
+			 ov64a40_stagger_hdr_mode.width,
+			 ov64a40_stagger_hdr_mode.height,
+			 ov64a40->mode->width, ov64a40->mode->height);
+		return -EINVAL;
+
+	/* Hidden from the menu; checked again so the rejection is logged. */
+	case OV64A40_HDR_MODE_2EXP_DCG:
+	case OV64A40_HDR_MODE_3EXP:
+		dev_warn(ov64a40->dev, "%s HDR is not supported\n",
+			 ov64a40_hdr_mode_menu[ov64a40->hdr_mode->val]);
 		return -EOPNOTSUPP;
 	}
 
@@ -3281,9 +3502,9 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 {
 	int ret = 0;
 
-	/* Undo a previous 4-cell HDR stream, the 4-cell case redoes it. */
-	cci_multi_reg_write(ov64a40->cci, ov64a40_4cell_hdr_off_regs,
-			    ARRAY_SIZE(ov64a40_4cell_hdr_off_regs), &ret);
+	/* Undo a previous HDR stream, the HDR cases redo it. */
+	cci_multi_reg_write(ov64a40->cci, ov64a40_hdr_off_regs,
+			    ARRAY_SIZE(ov64a40_hdr_off_regs), &ret);
 
 	if (!ov64a40->hdr_active) {
 		/*
@@ -3328,31 +3549,39 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 				    ARRAY_SIZE(ov64a40_4cell_hdr_regs), &ret);
 		break;
 
-	/* Experimental modes, see ov64a40_validate_hdr_mode(). */
-	case OV64A40_HDR_MODE_2EXP_LM:
-		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
-				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
-		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
-				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN,
-				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN, &ret);
-		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
-				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
-				OV64A40_TIMING_CTRL_23_STG_HDR_NUM |
-				OV64A40_TIMING_CTRL_23_DCG_EN,
-				OV64A40_TIMING_CTRL_23_STG_HDR_EN, &ret);
-		break;
+	case OV64A40_HDR_MODE_2EXP_LM: {
+		const struct ov64a40_timings *timings =
+			ov64a40_get_timings(ov64a40,
+					    ov64a40->link_freq->cur.val);
 
-	case OV64A40_HDR_MODE_2EXP_DCG:
+		/*
+		 * Uncombined 2-exposure stagger on the readout of
+		 * ov64a40_stagger_hdr_mode (4-cell horizontal binning and
+		 * double speed in 0x3821[4,0] are set by its subsampling).
+		 * 0x3821[5] would switch the ISP to its on-chip combine work
+		 * mode: keep it clear. four_cell_en stays set, as in the vendor
+		 * reference settings. The flip bits are left to the flip
+		 * controls.
+		 */
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
 				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN, 0, &ret);
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
 				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
-				OV64A40_TIMING_CTRL_23_DCG_EN,
-				OV64A40_TIMING_CTRL_23_DCG_EN, &ret);
+				OV64A40_TIMING_CTRL_23_STG_HDR_NUM |
+				OV64A40_TIMING_CTRL_23_DCG_EN |
+				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN,
+				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
+				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN, &ret);
+		cci_multi_reg_write(ov64a40->cci, ov64a40_stagger_hdr_regs,
+				    ARRAY_SIZE(ov64a40_stagger_hdr_regs), &ret);
+		/* hts_s = HTS, or the second exposure's lines overrun. */
+		cci_write(ov64a40->cci, OV64A40_REG_HTS_S, timings->ppl, &ret);
 		break;
+	}
 
+	case OV64A40_HDR_MODE_2EXP_DCG:
 	case OV64A40_HDR_MODE_3EXP:
 		/* Caller already rejected via ov64a40_validate_hdr_mode(). */
 		return -EOPNOTSUPP;
@@ -3391,25 +3620,51 @@ static int ov64a40_write_hdr_group(struct ov64a40 *ov64a40, unsigned int group,
 	return ret ?: err;
 }
 
-/*
- * Program the long, medium and short exposures for HDR. The medium/short
- * values are derived from the long via OV64A40_HDR_EXPOSURE_RATIO and
- * clamped to the sensor minimum.
- */
-static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exp_long)
+static bool ov64a40_stagger_active(struct ov64a40 *ov64a40)
 {
-	int exp_med = max_t(int, exp_long / OV64A40_HDR_EXPOSURE_RATIO,
-			    OV64A40_EXPOSURE_MIN);
-	int exp_short = max_t(int, exp_med / OV64A40_HDR_EXPOSURE_RATIO,
-			      OV64A40_EXPOSURE_MIN);
-	const struct cci_reg_sequence regs[] = {
-		{ OV64A40_REG_MEC_LONG_EXPO, exp_long },
-		{ OV64A40_REG_MEC_MEDIUM_EXPO, exp_med },
-		{ OV64A40_REG_MEC_SHORT_EXPO, exp_short },
+	return ov64a40->hdr_active &&
+	       ov64a40->active_hdr_mode == OV64A40_HDR_MODE_2EXP_LM;
+}
+
+/*
+ * Program the HDR exposures. The medium/short values are derived from the
+ * long via OV64A40_HDR_EXPOSURE_RATIO and clamped to the sensor minimum.
+ *
+ * In 2-exp-lm stagger HDR the exposure control is in lines, half a sensor
+ * row: only the long and the second (medium) exposure are written, in even
+ * numbers of rows. The control limits keep the second exposure within the
+ * VTS rule, see ov64a40_exposure_max().
+ */
+static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exposure)
+{
+	struct cci_reg_sequence regs[] = {
+		{ OV64A40_REG_MEC_LONG_EXPO, 0 },
+		{ OV64A40_REG_MEC_MEDIUM_EXPO, 0 },
+		{ OV64A40_REG_MEC_SHORT_EXPO, 0 },
 	};
+	unsigned int num_regs = ARRAY_SIZE(regs);
+	int exp_long, exp_med;
+
+	if (ov64a40_stagger_active(ov64a40)) {
+		exp_long = rounddown(exposure / OV64A40_STAGGER_ROW_LINES,
+				     OV64A40_STAGGER_EXPOSURE_STEP);
+		exp_long = max(exp_long, OV64A40_EXPOSURE_MIN);
+		exp_med = rounddown(exp_long / OV64A40_HDR_EXPOSURE_RATIO,
+				    OV64A40_STAGGER_EXPOSURE_STEP);
+		num_regs = 2;
+	} else {
+		exp_long = exposure;
+		exp_med = exp_long / OV64A40_HDR_EXPOSURE_RATIO;
+	}
+	exp_med = max(exp_med, OV64A40_EXPOSURE_MIN);
+
+	regs[0].val = exp_long;
+	regs[1].val = exp_med;
+	regs[2].val = max(exp_med / OV64A40_HDR_EXPOSURE_RATIO,
+			  OV64A40_EXPOSURE_MIN);
 
 	return ov64a40_write_hdr_group(ov64a40, OV64A40_GROUP_HDR_EXPOSURE,
-				       regs, ARRAY_SIZE(regs));
+				       regs, num_regs);
 }
 
 /*
@@ -3424,9 +3679,12 @@ static int ov64a40_program_hdr_gains(struct ov64a40 *ov64a40, int gain)
 		{ OV64A40_REG_MEC_MEDIUM_GAIN, gain << 1 },
 		{ OV64A40_REG_MEC_SHORT_GAIN, gain << 1 },
 	};
+	/* Stagger HDR: long and second exposure only. */
+	unsigned int num_regs = ov64a40_stagger_active(ov64a40) ?
+				2 : ARRAY_SIZE(regs);
 
 	return ov64a40_write_hdr_group(ov64a40, OV64A40_GROUP_HDR_GAIN,
-				       regs, ARRAY_SIZE(regs));
+				       regs, num_regs);
 }
 
 static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
@@ -3464,8 +3722,19 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 	 * An HDR request that cannot be honoured must not fail the stream
 	 * start: the CSI-2 receiver does not survive a failing s_stream.
 	 * Stream without HDR instead; the reason has been logged.
+	 *
+	 * The stagger frame size is the other way round: the sensor cannot
+	 * fill it without stagger HDR, so it always streams 2-exp-lm.
 	 */
-	if (ov64a40_validate_hdr_mode(ov64a40)) {
+	if (ov64a40_is_stagger(ov64a40->sensor_mode)) {
+		if (!ov64a40_stagger_active(ov64a40))
+			dev_warn(ov64a40->dev,
+				 "%ux%u is the 2-exp-lm stagger HDR format, streaming 2-exp-lm HDR\n",
+				 ov64a40->sensor_mode->width,
+				 ov64a40->sensor_mode->height);
+		ov64a40->hdr_active = true;
+		ov64a40->active_hdr_mode = OV64A40_HDR_MODE_2EXP_LM;
+	} else if (ov64a40_validate_hdr_mode(ov64a40)) {
 		dev_warn(ov64a40->dev, "streaming without HDR\n");
 		ov64a40->hdr_active = false;
 	}
@@ -3565,7 +3834,7 @@ static u32 ov64a40_mbus_code(struct ov64a40 *ov64a40)
 }
 
 static void ov64a40_update_pad_fmt(struct ov64a40 *ov64a40,
-				   struct ov64a40_mode *mode,
+				   const struct ov64a40_mode *mode,
 				   struct v4l2_mbus_framefmt *fmt)
 {
 	fmt->code = ov64a40_mbus_code(ov64a40);
@@ -3616,17 +3885,21 @@ static int ov64a40_enum_frame_size(struct v4l2_subdev *sd,
 				   struct v4l2_subdev_frame_size_enum *fse)
 {
 	struct ov64a40 *ov64a40 = sd_to_ov64a40(sd);
-	struct ov64a40_mode *mode;
+	const struct ov64a40_mode *mode;
 	u32 code;
 
-	if (fse->index >= ARRAY_SIZE(ov64a40_modes))
+	/* The stagger HDR frame size follows the modes, if offered. */
+	if (fse->index < ARRAY_SIZE(ov64a40_modes))
+		mode = &ov64a40_modes[fse->index];
+	else if (fse->index == ARRAY_SIZE(ov64a40_modes) && experimental_hdr)
+		mode = &ov64a40_stagger_hdr_mode;
+	else
 		return -EINVAL;
 
 	code = ov64a40_mbus_code(ov64a40);
 	if (fse->code != code)
 		return -EINVAL;
 
-	mode = &ov64a40_modes[fse->index];
 	fse->min_width = mode->width;
 	fse->max_width = mode->width;
 	fse->min_height = mode->height;
@@ -3671,13 +3944,20 @@ static int ov64a40_set_format(struct v4l2_subdev *sd,
 			      struct v4l2_subdev_format *fmt)
 {
 	struct ov64a40 *ov64a40 = sd_to_ov64a40(sd);
+	const struct ov64a40_mode *stagger = &ov64a40_stagger_hdr_mode;
 	struct v4l2_mbus_framefmt *format;
-	struct ov64a40_mode *mode;
+	const struct ov64a40_mode *mode;
 
-	mode = v4l2_find_nearest_size(ov64a40_modes,
-				      ARRAY_SIZE(ov64a40_modes),
-				      width, height,
-				      fmt->format.width, fmt->format.height);
+	/* The stagger HDR frame size is only selected by an exact match. */
+	if (experimental_hdr && fmt->format.width == stagger->width &&
+	    fmt->format.height == stagger->height)
+		mode = stagger;
+	else
+		mode = v4l2_find_nearest_size(ov64a40_modes,
+					      ARRAY_SIZE(ov64a40_modes),
+					      width, height,
+					      fmt->format.width,
+					      fmt->format.height);
 
 	ov64a40_update_pad_fmt(ov64a40, mode, &fmt->format);
 
@@ -3774,12 +4054,6 @@ static int ov64a40_link_freq_config(struct ov64a40 *ov64a40, int link_freq_id)
 	return ret;
 }
 
-static bool ov64a40_hdr_blocks_flips(struct ov64a40 *ov64a40)
-{
-	return ov64a40->hdr_active &&
-	       ov64a40->active_hdr_mode != OV64A40_HDR_MODE_4CELL;
-}
-
 static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ov64a40 *ov64a40 = container_of(ctrl->handler, struct ov64a40,
@@ -3809,13 +4083,14 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 	}
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
-		int exp_max = ov64a40->mode->height + ctrl->val
-			    - OV64A40_EXPOSURE_MARGIN;
+		int exp_max = ov64a40_exposure_max(ov64a40->sensor_mode,
+						   ctrl->val);
 		int exp_val = min(ov64a40->exposure->cur.val, exp_max);
 
 		__v4l2_ctrl_modify_range(ov64a40->exposure,
 					 ov64a40->exposure->minimum,
-					 exp_max, 1, exp_val);
+					 exp_max, ov64a40->exposure->step,
+					 exp_val);
 	}
 
 	pm_status = pm_runtime_get_if_active(ov64a40->dev);
@@ -3825,11 +4100,12 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
 		/*
-		 * In stagger HDR modes, the user's exposure value drives the
-		 * long-exposure register; medium and short are derived from
-		 * it via OV64A40_HDR_EXPOSURE_RATIO. 4-cell HDR uses the same
-		 * trio because all three exposures are present per pixel
-		 * within the 4-cell pattern, on-chip combined.
+		 * In HDR modes, the user's exposure value drives the
+		 * long-exposure register; the others are derived from it via
+		 * OV64A40_HDR_EXPOSURE_RATIO. 4-cell HDR uses the L/M/S trio
+		 * because all three exposures are present per pixel within the
+		 * 4-cell pattern, on-chip combined; 2-exp-lm stagger uses L
+		 * and M (in rows, the control is in half rows there).
 		 */
 		if (ov64a40->hdr_active) {
 			ret = ov64a40_program_hdr_exposures(ov64a40, ctrl->val);
@@ -3847,7 +4123,9 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 				ctrl->val << 1, NULL);
 		break;
 	case V4L2_CID_VBLANK: {
-		int vts = ctrl->val + ov64a40->mode->height;
+		/* In stagger HDR VTS counts rows of two lines. */
+		int vts = (ctrl->val + ov64a40->sensor_mode->height) /
+			  ov64a40_row_lines(ov64a40->sensor_mode);
 
 		cci_write(ov64a40->cci, OV64A40_REG_TIMINGS_VTS_LOW, vts, &ret);
 		cci_write(ov64a40->cci, OV64A40_REG_TIMINGS_VTS_MID,
@@ -3858,30 +4136,19 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 	}
 	case V4L2_CID_VFLIP:
 		/*
-		 * Sensor flips reverse the array readout order. In stagger
-		 * HDR that scrambles the L/M/S row interleave, so while a
-		 * stagger or DCG mode is active we silently skip the write
-		 * and rely on PiSP-side flip after the ISP. 4-cell HDR uses
-		 * the plain full-resolution readout and has been run with
-		 * 0x3820[2] set, so flips stay enabled there and the media
-		 * bus code keeps matching the output. We cannot return an
-		 * error here because
-		 * __v4l2_ctrl_handler_setup() walks every control at
-		 * stream-start, and an error would abort the walk and stop
-		 * the sensor from ever beginning to stream. The hflip/vflip
-		 * controls are grabbed in start_streaming so the user cannot
-		 * toggle them mid-stream.
+		 * Flips are applied in every mode, so that the media bus code
+		 * matches the output. Both HDR modes were run on hardware
+		 * with the flip bits as the controls program them (4-cell
+		 * with 0x3820[2] set, 2-exp-lm stagger with 0x3820[2] and
+		 * 0x3821[2] set). The hflip/vflip controls are grabbed in
+		 * start_streaming so the user cannot toggle them mid-stream.
 		 */
-		if (ov64a40_hdr_blocks_flips(ov64a40))
-			break;
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				      OV64A40_TIMING_CTRL_20_VFLIP,
 				      ctrl->val << 2,
 				      NULL);
 		break;
 	case V4L2_CID_HFLIP:
-		if (ov64a40_hdr_blocks_flips(ov64a40))
-			break;
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
 				      OV64A40_TIMING_CTRL_21_HFLIP,
 				      ctrl->val ? 0
@@ -3992,9 +4259,9 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 	 * boolean is the master switch (compatible with rpicam-apps' existing
 	 * --hdr sensor flag and any other libcamera client that consults it).
 	 * The vendor-specific OV64A40 menu selects which sensor HDR mode is
-	 * active when WIDE_DYNAMIC_RANGE is set. The default is 4-cell, the
-	 * only mode that produces frames; the others are hidden unless the
-	 * experimental_hdr module parameter is set.
+	 * active when WIDE_DYNAMIC_RANGE is set. The default is 4-cell.
+	 * 2-exp-lm is hidden unless the experimental_hdr module parameter is
+	 * set; 2-exp-dcg and 3-exp are always hidden.
 	 */
 	ov64a40->hdr_enable = v4l2_ctrl_new_std(hdlr, &ov64a40_ctrl_ops,
 						V4L2_CID_WIDE_DYNAMIC_RANGE,
@@ -4012,11 +4279,15 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 			.qmenu = ov64a40_hdr_mode_menu,
 		};
 
+		ov64a40_hdr_mode_cfg.menu_skip_mask =
+			OV64A40_HDR_MODES_UNSUPPORTED;
 		if (experimental_hdr)
 			dev_warn(ov64a40->dev,
-				 "experimental HDR modes enabled, they do not produce frames yet\n");
+				 "experimental 2-exp-lm stagger HDR enabled (%ux%u interleaved frame size)\n",
+				 ov64a40_stagger_hdr_mode.width,
+				 ov64a40_stagger_hdr_mode.height);
 		else
-			ov64a40_hdr_mode_cfg.menu_skip_mask =
+			ov64a40_hdr_mode_cfg.menu_skip_mask |=
 				OV64A40_HDR_MODES_EXPERIMENTAL;
 
 		ov64a40->hdr_mode =
