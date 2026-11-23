@@ -3448,9 +3448,15 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 	ov64a40->hdr_active = ov64a40->hdr_enable->val;
 	ov64a40->active_hdr_mode = ov64a40->hdr_mode->val;
 
-	ret = ov64a40_validate_hdr_mode(ov64a40);
-	if (ret)
-		goto error_power_off;
+	/*
+	 * An HDR request that cannot be honoured must not fail the stream
+	 * start: the CSI-2 receiver does not survive a failing s_stream.
+	 * Stream without HDR instead; the reason has been logged.
+	 */
+	if (ov64a40_validate_hdr_mode(ov64a40)) {
+		dev_warn(ov64a40->dev, "streaming without HDR\n");
+		ov64a40->hdr_active = false;
+	}
 
 	ret = ov64a40_program_geometry(ov64a40);
 	if (ret)
@@ -3876,6 +3882,9 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_LINK_FREQ:
 		ret = ov64a40_link_freq_config(ov64a40, ctrl->val);
+		break;
+	case V4L2_CID_HBLANK:
+		/* Read-only, fixed per mode: nothing to program. */
 		break;
 	case V4L2_CID_WIDE_DYNAMIC_RANGE:
 	case V4L2_CID_OV64A40_HDR_MODE:
