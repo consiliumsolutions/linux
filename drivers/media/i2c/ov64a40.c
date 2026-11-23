@@ -134,8 +134,9 @@
  *   0x3823[6] = stg_hdr_num   (0 = 2-exp, 1 = 3-exp)
  *   0x3823[2] = four_cell_en  (set by the init list, left set in all modes)
  *   0x3823[1] = dcg_en        (dual conversion gain)
- *   0x3821[4] = hbin_4c       (4-cell horizontal binning, required for
- *                              4-cell HDR's half-resolution output)
+ *   0x3821[4] = hbin_4c       (4-cell horizontal binning; must be off in
+ *                              4-cell HDR, which uses the full-resolution
+ *                              readout, see ov64a40_4cell_hdr_mode)
  */
 #define OV64A40_REG_TIMING_CTRL_23		CCI_REG8(0x3823)
 #define OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN	BIT(3)
@@ -2664,6 +2665,8 @@ static struct ov64a40_mode {
 	struct v4l2_rect analogue_crop;
 	struct v4l2_rect digital_crop;
 	struct ov64a40_subsampling subsampling;
+	/* Minimum VTS, if larger than height + OV64A40_VBLANK_MIN. */
+	unsigned int vts_min;
 } ov64a40_modes[] = {
 	/* Full resolution */
 	{
@@ -2913,6 +2916,63 @@ static struct ov64a40_mode {
 	},
 };
 
+/*
+ * 4-cell HDR at 4624x3472. Not listed in ov64a40_modes[]: it is used in place
+ * of the 2x2 binned 4624x3472 mode while 4-cell HDR is selected.
+ *
+ * Measured on hardware: from the binned readout the on-chip 4-cell HDR
+ * pipeline only receives a quarter-size image per exposure. From the
+ * full-resolution readout with a 4624x3472 output window it switches to its
+ * HDR work mode with three full-size exposure pipes and completes frames.
+ * The mode therefore uses the register list, readout, skipping configuration
+ * and timings of the 9248x6944 mode; only the output window differs.
+ */
+static const struct ov64a40_mode ov64a40_4cell_hdr_mode = {
+	.width = 4624,
+	.height = 3472,
+	.timings_default = {
+		[OV64A40_LINK_FREQ_456M_ID] = {
+			.vts = 7072,
+			.ppl = 4072,
+		},
+		/* 2 FPS */
+		[OV64A40_LINK_FREQ_360M_ID] = {
+			.vts = 7072,
+			.ppl = 5248,
+		},
+	},
+	.reglist = {
+		.num_regs = ARRAY_SIZE(ov64a40_9248x6944),
+		.regvals = ov64a40_9248x6944,
+	},
+	.analogue_crop = {
+		.left = 0,
+		.top = 0,
+		.width = 9280,
+		.height = 6976,
+	},
+	/*
+	 * Measured: with the 9248x6944 vertical offset of 16 (0x3813 = 0x10)
+	 * only 3462 lines are output; an offset of 0 gives all 3472.
+	 */
+	.digital_crop = {
+		.left = 17,
+		.top = 0,
+		.width = 4624,
+		.height = 3472,
+	},
+	.subsampling = {
+		.x_odd_inc = 1,
+		.x_even_inc = 1,
+		.y_odd_inc = 1,
+		.y_even_inc = 1,
+		.vbin = false,
+		.hbin = false,
+	},
+	/* All 6944 rows are read out: keep the 9248x6944 frame length limit. */
+	.vts_min = 6944 + OV64A40_VBLANK_MIN,
+};
+
 struct ov64a40 {
 	struct device *dev;
 
@@ -2922,6 +2982,12 @@ struct ov64a40 {
 	struct regmap *cci;
 
 	struct ov64a40_mode *mode;
+	/*
+	 * Mode programmed into the sensor: either mode, or a variant of it
+	 * selected by the HDR controls (ov64a40_4cell_hdr_mode). Timings and
+	 * control limits are derived from it.
+	 */
+	const struct ov64a40_mode *sensor_mode;
 
 	struct clk *xclk;
 
@@ -2963,14 +3029,60 @@ ov64a40_get_timings(struct ov64a40 *ov64a40, unsigned int link_freq_index)
 				   ? OV64A40_LINK_FREQ_360M_ID
 				   : OV64A40_LINK_FREQ_456M_ID;
 
-	return &ov64a40->mode->timings_default[timings_index];
+	return &ov64a40->sensor_mode->timings_default[timings_index];
+}
+
+static unsigned int ov64a40_vblank_min(const struct ov64a40_mode *mode)
+{
+	return max(mode->vts_min, mode->height + OV64A40_VBLANK_MIN) -
+	       mode->height;
+}
+
+static const struct ov64a40_mode *
+ov64a40_find_sensor_mode(struct ov64a40 *ov64a40, bool hdr_enable,
+			 s32 hdr_mode)
+{
+	const struct ov64a40_mode *hdr = &ov64a40_4cell_hdr_mode;
+
+	if (hdr_enable && hdr_mode == OV64A40_HDR_MODE_4CELL &&
+	    ov64a40->mode->width == hdr->width &&
+	    ov64a40->mode->height == hdr->height)
+		return hdr;
+
+	return ov64a40->mode;
+}
+
+/* Update the blanking and exposure limits for ov64a40->sensor_mode. */
+static void ov64a40_update_ctrl_limits(struct ov64a40 *ov64a40)
+{
+	const struct ov64a40_mode *mode = ov64a40->sensor_mode;
+	const struct ov64a40_timings *timings;
+	int vblank_max, vblank_def;
+	int hblank_val;
+	int exp_max;
+
+	timings = ov64a40_get_timings(ov64a40, ov64a40->link_freq->cur.val);
+	vblank_max = OV64A40_VTS_MAX - mode->height;
+	vblank_def = timings->vts - mode->height;
+	__v4l2_ctrl_modify_range(ov64a40->vblank, ov64a40_vblank_min(mode),
+				 vblank_max, 1, vblank_def);
+	__v4l2_ctrl_s_ctrl(ov64a40->vblank, vblank_def);
+
+	exp_max = timings->vts - OV64A40_EXPOSURE_MARGIN;
+	__v4l2_ctrl_modify_range(ov64a40->exposure,
+				 OV64A40_EXPOSURE_MIN, exp_max,
+				 1, OV64A40_EXPOSURE_MIN);
+
+	hblank_val = timings->ppl * 4 - mode->width;
+	__v4l2_ctrl_modify_range(ov64a40->hblank,
+				 hblank_val, hblank_val, 1, hblank_val);
 }
 
 static int ov64a40_program_geometry(struct ov64a40 *ov64a40)
 {
-	struct ov64a40_mode *mode = ov64a40->mode;
-	struct v4l2_rect *anacrop = &mode->analogue_crop;
-	struct v4l2_rect *digicrop = &mode->digital_crop;
+	const struct ov64a40_mode *mode = ov64a40->sensor_mode;
+	const struct v4l2_rect *anacrop = &mode->analogue_crop;
+	const struct v4l2_rect *digicrop = &mode->digital_crop;
 	const struct ov64a40_timings *timings;
 	int ret = 0;
 
@@ -3004,7 +3116,8 @@ static int ov64a40_program_geometry(struct ov64a40 *ov64a40)
 
 static int ov64a40_program_subsampling(struct ov64a40 *ov64a40)
 {
-	struct ov64a40_subsampling *subsampling = &ov64a40->mode->subsampling;
+	const struct ov64a40_subsampling *subsampling =
+		&ov64a40->sensor_mode->subsampling;
 	int ret = 0;
 
 	/* Skipping configuration */
@@ -3098,13 +3211,19 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 
 	switch (ov64a40->active_hdr_mode) {
 	case OV64A40_HDR_MODE_4CELL:
+		/*
+		 * Full-resolution readout (ov64a40_4cell_hdr_mode): no 4-cell
+		 * binning. Only the HDR enable is set; the flip bits in
+		 * 0x3820[2] and 0x3821[2] are left to the flip controls.
+		 */
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
+				OV64A40_TIMING_CTRL_20_VBIN |
 				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN,
 				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, &ret);
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
 				OV64A40_TIMING_CTRL_21_HBIN_4C |
 				OV64A40_TIMING_CTRL_21_HDR_2EXPO_EN,
-				OV64A40_TIMING_CTRL_21_HBIN_4C, &ret);
+				0, &ret);
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_23,
 				OV64A40_TIMING_CTRL_23_STG_HDR_EN |
 				OV64A40_TIMING_CTRL_23_DCG_EN |
@@ -3168,7 +3287,7 @@ static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exp_long)
 static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 				   struct v4l2_subdev_state *state)
 {
-	const struct ov64a40_reglist *reglist = &ov64a40->mode->reglist;
+	const struct ov64a40_reglist *reglist = &ov64a40->sensor_mode->reglist;
 	const struct ov64a40_timings *timings;
 	unsigned long delay;
 	int ret;
@@ -3416,31 +3535,15 @@ static int ov64a40_set_format(struct v4l2_subdev *sd,
 		return 0;
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
-		const struct ov64a40_timings *timings;
-		int vblank_max, vblank_def;
-		int hblank_val;
-		int exp_max;
-
 		ov64a40->mode = mode;
+		ov64a40->sensor_mode =
+			ov64a40_find_sensor_mode(ov64a40,
+						 ov64a40->hdr_enable->cur.val,
+						 ov64a40->hdr_mode->cur.val);
 		*v4l2_subdev_state_get_crop(state, 0) = mode->analogue_crop;
 
 		/* Update control limits according to the new mode. */
-		timings = ov64a40_get_timings(ov64a40,
-					      ov64a40->link_freq->cur.val);
-		vblank_max = OV64A40_VTS_MAX - mode->height;
-		vblank_def = timings->vts - mode->height;
-		__v4l2_ctrl_modify_range(ov64a40->vblank, OV64A40_VBLANK_MIN,
-					 vblank_max, 1, vblank_def);
-		__v4l2_ctrl_s_ctrl(ov64a40->vblank, vblank_def);
-
-		exp_max = timings->vts - OV64A40_EXPOSURE_MARGIN;
-		__v4l2_ctrl_modify_range(ov64a40->exposure,
-					 OV64A40_EXPOSURE_MIN, exp_max,
-					 1, OV64A40_EXPOSURE_MIN);
-
-		hblank_val = timings->ppl * 4 - mode->width;
-		__v4l2_ctrl_modify_range(ov64a40->hblank,
-					 hblank_val, hblank_val, 1, hblank_val);
+		ov64a40_update_ctrl_limits(ov64a40);
 	}
 
 	*format = fmt->format;
@@ -3520,12 +3623,39 @@ static int ov64a40_link_freq_config(struct ov64a40 *ov64a40, int link_freq_id)
 	return ret;
 }
 
+static bool ov64a40_hdr_blocks_flips(struct ov64a40 *ov64a40)
+{
+	return ov64a40->hdr_active &&
+	       ov64a40->active_hdr_mode != OV64A40_HDR_MODE_4CELL;
+}
+
 static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ov64a40 *ov64a40 = container_of(ctrl->handler, struct ov64a40,
 					       ctrl_handler);
 	int pm_status;
 	int ret = 0;
+
+	if (ctrl->id == V4L2_CID_WIDE_DYNAMIC_RANGE ||
+	    ctrl->id == V4L2_CID_OV64A40_HDR_MODE) {
+		bool hdr_enable = ctrl->id == V4L2_CID_WIDE_DYNAMIC_RANGE ?
+				  ctrl->val : ov64a40->hdr_enable->cur.val;
+		s32 hdr_mode = ctrl->id == V4L2_CID_OV64A40_HDR_MODE ?
+			       ctrl->val : ov64a40->hdr_mode->cur.val;
+		const struct ov64a40_mode *sensor_mode =
+			ov64a40_find_sensor_mode(ov64a40, hdr_enable, hdr_mode);
+
+		/*
+		 * 4-cell HDR changes the readout and the timings: report its
+		 * blanking and exposure limits. Only on an actual change, so
+		 * that the control handler setup at stream start does not
+		 * reset VBLANK.
+		 */
+		if (sensor_mode != ov64a40->sensor_mode) {
+			ov64a40->sensor_mode = sensor_mode;
+			ov64a40_update_ctrl_limits(ov64a40);
+		}
+	}
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		int exp_max = ov64a40->mode->height + ctrl->val
@@ -3575,17 +3705,20 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_VFLIP:
 		/*
 		 * Sensor flips reverse the array readout order. In stagger
-		 * HDR that scrambles the L/M/S row interleave; in 4-cell HDR
-		 * it scrambles the per-cell exposure assignments. While HDR
-		 * is active we silently skip the write and rely on PiSP-side
-		 * flip after the ISP. We cannot return an error here because
+		 * HDR that scrambles the L/M/S row interleave, so while a
+		 * stagger or DCG mode is active we silently skip the write
+		 * and rely on PiSP-side flip after the ISP. 4-cell HDR uses
+		 * the plain full-resolution readout and has been run with
+		 * 0x3820[2] set, so flips stay enabled there and the media
+		 * bus code keeps matching the output. We cannot return an
+		 * error here because
 		 * __v4l2_ctrl_handler_setup() walks every control at
 		 * stream-start, and an error would abort the walk and stop
 		 * the sensor from ever beginning to stream. The hflip/vflip
 		 * controls are grabbed in start_streaming so the user cannot
 		 * toggle them mid-stream.
 		 */
-		if (ov64a40->hdr_active)
+		if (ov64a40_hdr_blocks_flips(ov64a40))
 			break;
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				      OV64A40_TIMING_CTRL_20_VFLIP,
@@ -3593,7 +3726,7 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 				      NULL);
 		break;
 	case V4L2_CID_HFLIP:
-		if (ov64a40->hdr_active)
+		if (ov64a40_hdr_blocks_flips(ov64a40))
 			break;
 		ret = cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_21,
 				      OV64A40_TIMING_CTRL_21_HFLIP,
@@ -3679,7 +3812,8 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 	vblank_def = timings->vts - ov64a40->mode->height;
 	vblank_max = OV64A40_VTS_MAX - ov64a40->mode->height;
 	ov64a40->vblank = v4l2_ctrl_new_std(hdlr, &ov64a40_ctrl_ops,
-					    V4L2_CID_VBLANK, OV64A40_VBLANK_MIN,
+					    V4L2_CID_VBLANK,
+					    ov64a40_vblank_min(ov64a40->mode),
 					    vblank_max, 1, vblank_def);
 
 	v4l2_ctrl_new_std(hdlr, &ov64a40_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
@@ -3915,6 +4049,7 @@ static int ov64a40_probe(struct i2c_client *client)
 		goto error_poweroff;
 
 	ov64a40->mode = &ov64a40_modes[0];
+	ov64a40->sensor_mode = ov64a40->mode;
 
 	pm_runtime_set_active(&client->dev);
 	pm_runtime_get_noresume(&client->dev);
