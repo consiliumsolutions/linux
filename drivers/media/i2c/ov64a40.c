@@ -3016,9 +3016,10 @@ static int ov64a40_program_subsampling(struct ov64a40 *ov64a40)
 }
 
 /*
- * HDR helpers. Called from start_streaming after the per-mode reglist has
- * been written but before the geometry programming, so that any HDR-specific
- * register overrides take precedence over the mode defaults.
+ * HDR helpers. ov64a40_program_hdr() is called from start_streaming after the
+ * per-mode reglist, the geometry and the subsampling have been programmed, so
+ * that HDR-specific register overrides take precedence over the mode defaults
+ * (ov64a40_program_subsampling() rewrites 0x3820 and 0x3821).
  */
 
 static int ov64a40_validate_hdr_mode(struct ov64a40 *ov64a40)
@@ -3161,10 +3162,10 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 		goto error_power_off;
 
 	/*
-	 * Latch HDR state from the user-facing controls and program the
-	 * sensor's HDR enables. Done before the V4L2 ctrl-handler walk so
-	 * that when EXPOSURE is reapplied below, hdr_active is set and the
-	 * s_ctrl handler will write the L/M/S exposure trio.
+	 * Latch HDR state from the user-facing controls. Done before the
+	 * V4L2 ctrl-handler walk so that when EXPOSURE is reapplied below,
+	 * hdr_active is set and the s_ctrl handler will write the L/M/S
+	 * exposure trio.
 	 */
 	ov64a40->hdr_active = ov64a40->hdr_enable->val;
 	ov64a40->active_hdr_mode = ov64a40->hdr_mode->val;
@@ -3173,15 +3174,19 @@ static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
 	if (ret)
 		goto error_power_off;
 
-	ret = ov64a40_program_hdr(ov64a40);
-	if (ret)
-		goto error_power_off;
-
 	ret = ov64a40_program_geometry(ov64a40);
 	if (ret)
 		goto error_power_off;
 
 	ret = ov64a40_program_subsampling(ov64a40);
+	if (ret)
+		goto error_power_off;
+
+	/*
+	 * HDR last: ov64a40_program_subsampling() rewrites the binning bits
+	 * in 0x3820/0x3821 and would otherwise undo the HDR configuration.
+	 */
+	ret = ov64a40_program_hdr(ov64a40);
 	if (ret)
 		goto error_power_off;
 
