@@ -157,6 +157,27 @@
 #define OV64A40_REG_MEC_SHORT_EXPO	CCI_REG24(0x3580)
 #define OV64A40_REG_MEC_SHORT_GAIN	CCI_REG16(0x3588)
 
+/*
+ * Stream and post-pipe registers that 4-cell HDR needs on top of the timing
+ * control bits, see ov64a40_4cell_hdr_regs[].
+ */
+#define OV64A40_REG_PD_CTRL			CCI_REG8(0x3684)
+#define OV64A40_PD_CTRL_DATA_EN			BIT(1)
+/* [7:4]: virtual channel of the PD stream. */
+#define OV64A40_REG_MIPI_VC_SEL_PD		CCI_REG8(0x4836)
+#define OV64A40_MIPI_VC_SEL_PD_DEFAULT		0x32
+#define OV64A40_MIPI_VC_SEL_PD_VC0		0x02
+/* [7:6]: line skip mode. */
+#define OV64A40_REG_PRE_PIPE_TOP_2		CCI_REG8(0x5002)
+#define OV64A40_PRE_PIPE_TOP_2_4CELL_HDR	0x35
+#define OV64A40_REG_PD_WIN_HEIGHT		CCI_REG16(0x5066)
+/* [6:4]: combine option. */
+#define OV64A40_REG_POST_PIPE_1			CCI_REG8(0x6801)
+#define OV64A40_POST_PIPE_1_COMBINE_3EXP	0x11
+#define OV64A40_REG_POST_PIPE_2			CCI_REG8(0x6802)
+#define OV64A40_POST_PIPE_2_GAIN_APPLY_EN	BIT(3)
+#define OV64A40_POST_PIPE_2_DEFAULT		0x3f
+
 /* Long->Medium and Medium->Short row distances for stagger HDR. */
 #define OV64A40_REG_LM_DISTANCE_MAN	CCI_REG24(0x3850)
 #define OV64A40_REG_MS_DISTANCE_MAN	CCI_REG24(0x3853)
@@ -2625,6 +2646,48 @@ static const struct cci_reg_sequence ov64a40_1920x1080[] = {
 	{ CCI_REG8(0x480C), 0x92 }
 };
 
+/*
+ * 4-cell HDR stream settings, written by ov64a40_program_hdr() after the
+ * timing control bits. All measured on hardware with the full-resolution
+ * readout of ov64a40_4cell_hdr_mode:
+ *
+ * - Frame start and frame end are sent only on the PD stream's virtual
+ *   channel in this mode (VC3 by default). Moving that stream to VC0 makes
+ *   frames complete on the channel the receiver captures. PD data output
+ *   (0x3684[1]) must stay enabled, the sensor stalls without it; it is set
+ *   by the init list and asserted by ov64a40_program_hdr().
+ * - The init value of 0x5002 (0xf5) skips lines in this mode: only every
+ *   fourth line pair of each exposure reaches the output (about 856 of
+ *   3472 lines). 0x5002[7:6] = 0 gives all 3472 lines; 0x5002[1] must stay
+ *   clear, the sensor stops streaming with it set.
+ * - A PD window height of 0 (0x5066/0x5067) removes the PD payload packets
+ *   while frame start/end keep arriving, leaving only image lines on VC0.
+ * - The 3-exposure combine (0x6801 = 0x11) merges L, M and S as expected.
+ * - The tone gain apply stage (0x6802[3]) uses on-chip tables that are not
+ *   initialised and produces tile-shaped artefacts: keep it off.
+ *
+ * Further 4-cell HDR register writes belong here.
+ */
+static const struct cci_reg_sequence ov64a40_4cell_hdr_regs[] = {
+	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_VC0 },
+	{ OV64A40_REG_PRE_PIPE_TOP_2, OV64A40_PRE_PIPE_TOP_2_4CELL_HDR },
+	{ OV64A40_REG_PD_WIN_HEIGHT, 0 },
+	{ OV64A40_REG_POST_PIPE_1, OV64A40_POST_PIPE_1_COMBINE_3EXP },
+	{ OV64A40_REG_POST_PIPE_2, OV64A40_POST_PIPE_2_DEFAULT &
+				   ~OV64A40_POST_PIPE_2_GAIN_APPLY_EN },
+};
+
+/*
+ * Non-HDR values of the ov64a40_4cell_hdr_regs[] registers that ov64a40_init
+ * does not rewrite on every stream start. 0x3684, 0x5002, 0x5066/0x5067,
+ * 0x6801 and 0x6802 are restored by ov64a40_init and the per-mode register
+ * lists (some of which set 0x5002 themselves), 0x3812/0x3813 by
+ * ov64a40_program_geometry().
+ */
+static const struct cci_reg_sequence ov64a40_4cell_hdr_off_regs[] = {
+	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_DEFAULT },
+};
+
 /* 456MHz MIPI link frequency with 24MHz input clock. */
 static const struct cci_reg_sequence ov64a40_pll_config[] = {
 	{ OV64A40_PLL1_PRE_DIV0, 0x88 },
@@ -3193,6 +3256,10 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 {
 	int ret = 0;
 
+	/* Undo a previous 4-cell HDR stream, the 4-cell case redoes it. */
+	cci_multi_reg_write(ov64a40->cci, ov64a40_4cell_hdr_off_regs,
+			    ARRAY_SIZE(ov64a40_4cell_hdr_off_regs), &ret);
+
 	if (!ov64a40->hdr_active) {
 		/*
 		 * Clear all HDR enable bits. four_cell_en (bit 2 of 0x3823)
@@ -3229,6 +3296,11 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 				OV64A40_TIMING_CTRL_23_DCG_EN |
 				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN,
 				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN, &ret);
+		cci_update_bits(ov64a40->cci, OV64A40_REG_PD_CTRL,
+				OV64A40_PD_CTRL_DATA_EN,
+				OV64A40_PD_CTRL_DATA_EN, &ret);
+		cci_multi_reg_write(ov64a40->cci, ov64a40_4cell_hdr_regs,
+				    ARRAY_SIZE(ov64a40_4cell_hdr_regs), &ret);
 		break;
 
 	/* Experimental modes, see ov64a40_validate_hdr_mode(). */
