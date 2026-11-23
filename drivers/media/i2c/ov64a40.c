@@ -185,6 +185,11 @@
 #define OV64A40_REG_POST_PIPE_2			CCI_REG8(0x6802)
 #define OV64A40_POST_PIPE_2_GAIN_APPLY_EN	BIT(3)
 #define OV64A40_POST_PIPE_2_DEFAULT		0x3f
+/* Black level blocks of the long (0x40xx) exposure: black line window. */
+#define OV64A40_REG_BLC_L_BL_END		CCI_REG8(0x4016)
+#define OV64A40_REG_BLC_L_CTRL_18		CCI_REG8(0x4018)
+#define OV64A40_BLC_BL_END_HDR			0x0f
+#define OV64A40_BLC_L_CTRL_18_HDR		0x03
 
 /* Long->Medium and Medium->Short row distances for stagger HDR. */
 #define OV64A40_REG_LM_DISTANCE_MAN	CCI_REG24(0x3850)
@@ -2678,10 +2683,17 @@ static const struct cci_reg_sequence ov64a40_1920x1080[] = {
  * - The 3-exposure combine (0x6801 = 0x11) merges L, M and S as expected.
  * - The tone gain apply stage (0x6802[3]) uses on-chip tables that are not
  *   initialised and produces tile-shaped artefacts: keep it off.
+ * - With the black line window end of the 9248x6944 settings (0x4016 =
+ *   0x1f, 0x4018 = 0x07) the black level block never calibrates in this
+ *   mode and the raw pedestal (about 191 instead of 64 at 10 bits) reaches
+ *   the output. The window of the 4624x3472 mode fixes it. ov64a40_init
+ *   rewrites both registers on every stream start.
  *
  * Further 4-cell HDR register writes belong here.
  */
 static const struct cci_reg_sequence ov64a40_4cell_hdr_regs[] = {
+	{ OV64A40_REG_BLC_L_BL_END, OV64A40_BLC_BL_END_HDR },
+	{ OV64A40_REG_BLC_L_CTRL_18, OV64A40_BLC_L_CTRL_18_HDR },
 	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_VC0 },
 	{ OV64A40_REG_PRE_PIPE_TOP_2, OV64A40_PRE_PIPE_TOP_2_4CELL_HDR },
 	{ OV64A40_REG_PD_WIN_HEIGHT, 0 },
@@ -2692,10 +2704,10 @@ static const struct cci_reg_sequence ov64a40_4cell_hdr_regs[] = {
 
 /*
  * Non-HDR values of the ov64a40_4cell_hdr_regs[] registers that ov64a40_init
- * does not rewrite on every stream start. 0x3684, 0x5002, 0x5066/0x5067,
- * 0x6801 and 0x6802 are restored by ov64a40_init and the per-mode register
- * lists (some of which set 0x5002 themselves), 0x3812/0x3813 by
- * ov64a40_program_geometry().
+ * does not rewrite on every stream start. 0x3684, 0x4016, 0x4018, 0x5002,
+ * 0x5066/0x5067, 0x6801 and 0x6802 are restored by ov64a40_init and the
+ * per-mode register lists (some of which set 0x4016, 0x4018 and 0x5002
+ * themselves), 0x3812/0x3813 by ov64a40_program_geometry().
  */
 static const struct cci_reg_sequence ov64a40_4cell_hdr_off_regs[] = {
 	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_DEFAULT },
