@@ -112,6 +112,14 @@
 #define OV64A40_REG_SMIA		CCI_REG8(0x0100)
 #define OV64A40_REG_SMIA_STREAMING	BIT(0)
 
+/* Group hold: [7:4] operation, [3:0] group. */
+#define OV64A40_REG_GROUP_ACCESS	CCI_REG8(0x3208)
+#define OV64A40_GROUP_HOLD_START	0x00
+#define OV64A40_GROUP_HOLD_END		0x10
+#define OV64A40_GROUP_LAUNCH_DELAY	0xa0
+#define OV64A40_GROUP_HDR_EXPOSURE	0
+#define OV64A40_GROUP_HDR_GAIN		1
+
 /*
  * HDR control. The OV64A40 supports four sensor-side HDR modes which we
  * expose via a vendor menu control:
@@ -213,6 +221,11 @@ static const char * const ov64a40_hdr_mode_menu[] = {
 #define OV64A40_HDR_MODES_EXPERIMENTAL	(BIT_ULL(OV64A40_HDR_MODE_2EXP_LM) | \
 					 BIT_ULL(OV64A40_HDR_MODE_2EXP_DCG) | \
 					 BIT_ULL(OV64A40_HDR_MODE_3EXP))
+
+static bool hdr_group_hold = true;
+module_param(hdr_group_hold, bool, 0644);
+MODULE_PARM_DESC(hdr_group_hold,
+		 "Apply the HDR long/medium/short exposure and gain updates through group hold (default: on)");
 
 static bool experimental_hdr;
 module_param(experimental_hdr, bool, 0444);
@@ -3337,11 +3350,39 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 }
 
 /*
- * Compute and program the medium and short exposures for stagger HDR. The
- * long exposure is left untouched here -- callers program it via the
- * existing OV64A40_REG_MEC_LONG_EXPO path. The medium/short values are
- * derived from the long via OV64A40_HDR_EXPOSURE_RATIO and clamped to the
- * sensor minimum.
+ * Write a set of HDR long/medium/short registers so that they take effect in
+ * the same frame: hold them in a group and launch it in the next vertical
+ * blanking (in software standby the launch happens immediately). Exposure
+ * and gain use separate groups, as they are updated by separate controls
+ * that can both change within one frame.
+ */
+static int ov64a40_write_hdr_group(struct ov64a40 *ov64a40, unsigned int group,
+				   const struct cci_reg_sequence *regs,
+				   unsigned int num_regs)
+{
+	int ret = 0;
+	int err = 0;
+
+	if (!hdr_group_hold)
+		return cci_multi_reg_write(ov64a40->cci, regs, num_regs, NULL);
+
+	cci_write(ov64a40->cci, OV64A40_REG_GROUP_ACCESS,
+		  OV64A40_GROUP_HOLD_START | group, &ret);
+	cci_multi_reg_write(ov64a40->cci, regs, num_regs, &ret);
+
+	/* Close and launch the group even if a write failed. */
+	cci_write(ov64a40->cci, OV64A40_REG_GROUP_ACCESS,
+		  OV64A40_GROUP_HOLD_END | group, &err);
+	cci_write(ov64a40->cci, OV64A40_REG_GROUP_ACCESS,
+		  OV64A40_GROUP_LAUNCH_DELAY | group, &err);
+
+	return ret ?: err;
+}
+
+/*
+ * Program the long, medium and short exposures for HDR. The medium/short
+ * values are derived from the long via OV64A40_HDR_EXPOSURE_RATIO and
+ * clamped to the sensor minimum.
  */
 static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exp_long)
 {
@@ -3349,11 +3390,31 @@ static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exp_long)
 			    OV64A40_EXPOSURE_MIN);
 	int exp_short = max_t(int, exp_med / OV64A40_HDR_EXPOSURE_RATIO,
 			      OV64A40_EXPOSURE_MIN);
-	int ret = 0;
+	const struct cci_reg_sequence regs[] = {
+		{ OV64A40_REG_MEC_LONG_EXPO, exp_long },
+		{ OV64A40_REG_MEC_MEDIUM_EXPO, exp_med },
+		{ OV64A40_REG_MEC_SHORT_EXPO, exp_short },
+	};
 
-	cci_write(ov64a40->cci, OV64A40_REG_MEC_MEDIUM_EXPO, exp_med, &ret);
-	cci_write(ov64a40->cci, OV64A40_REG_MEC_SHORT_EXPO, exp_short, &ret);
-	return ret;
+	return ov64a40_write_hdr_group(ov64a40, OV64A40_GROUP_HDR_EXPOSURE,
+				       regs, ARRAY_SIZE(regs));
+}
+
+/*
+ * Program the long, medium and short analogue gains for HDR. The exposure
+ * ratio is carried by the exposure times, so all three use the same gain;
+ * without this the medium and short gains stay at their init values.
+ */
+static int ov64a40_program_hdr_gains(struct ov64a40 *ov64a40, int gain)
+{
+	const struct cci_reg_sequence regs[] = {
+		{ OV64A40_REG_MEC_LONG_GAIN, gain << 1 },
+		{ OV64A40_REG_MEC_MEDIUM_GAIN, gain << 1 },
+		{ OV64A40_REG_MEC_SHORT_GAIN, gain << 1 },
+	};
+
+	return ov64a40_write_hdr_group(ov64a40, OV64A40_GROUP_HDR_GAIN,
+				       regs, ARRAY_SIZE(regs));
 }
 
 static int ov64a40_start_streaming(struct ov64a40 *ov64a40,
@@ -3754,13 +3815,16 @@ static int ov64a40_set_ctrl(struct v4l2_ctrl *ctrl)
 		 */
 		if (ov64a40->hdr_active) {
 			ret = ov64a40_program_hdr_exposures(ov64a40, ctrl->val);
-			if (ret)
-				break;
+			break;
 		}
 		ret = cci_write(ov64a40->cci, OV64A40_REG_MEC_LONG_EXPO,
 				ctrl->val, NULL);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
+		if (ov64a40->hdr_active) {
+			ret = ov64a40_program_hdr_gains(ov64a40, ctrl->val);
+			break;
+		}
 		ret = cci_write(ov64a40->cci, OV64A40_REG_MEC_LONG_GAIN,
 				ctrl->val << 1, NULL);
 		break;
