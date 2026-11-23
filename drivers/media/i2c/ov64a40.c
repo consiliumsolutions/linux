@@ -123,12 +123,16 @@
  *   3-exp       : 3-exposure stagger HDR (gated, returns -EOPNOTSUPP until
  *                 PiSP 3-stream stagger ingest is verified).
  *
+ * The 2-exp-lm, 2-exp-dcg and 3-exp modes do not produce frames on hardware
+ * yet. They are experimental and hidden from the menu unless the
+ * experimental_hdr module parameter is set.
+ *
  * Stagger HDR bit arrangement spans three timing-control registers:
  *   0x3820[3] = hdr_3expo_en  (3-exposure format)
  *   0x3821[5] = hdr_2expo_en  (2-exposure format)
  *   0x3823[7] = stg_hdr_en    (stagger readout master enable)
  *   0x3823[6] = stg_hdr_num   (0 = 2-exp, 1 = 3-exp)
- *   0x3823[2] = four_cell_en  (4-cell HDR, default-on)
+ *   0x3823[2] = four_cell_en  (set by the init list, left set in all modes)
  *   0x3823[1] = dcg_en        (dual conversion gain)
  *   0x3821[4] = hbin_4c       (4-cell horizontal binning, required for
  *                              4-cell HDR's half-resolution output)
@@ -183,6 +187,15 @@ static const char * const ov64a40_hdr_mode_menu[] = {
 	"2-exp-dcg",
 	"3-exp",
 };
+
+#define OV64A40_HDR_MODES_EXPERIMENTAL	(BIT_ULL(OV64A40_HDR_MODE_2EXP_LM) | \
+					 BIT_ULL(OV64A40_HDR_MODE_2EXP_DCG) | \
+					 BIT_ULL(OV64A40_HDR_MODE_3EXP))
+
+static bool experimental_hdr;
+module_param(experimental_hdr, bool, 0444);
+MODULE_PARM_DESC(experimental_hdr,
+		 "Offer the stagger and DCG HDR modes, which do not produce frames yet (default: off)");
 
 enum ov64a40_link_freq_ids {
 	OV64A40_LINK_FREQ_456M_ID,
@@ -3040,6 +3053,18 @@ static int ov64a40_validate_hdr_mode(struct ov64a40 *ov64a40)
 
 	case OV64A40_HDR_MODE_2EXP_LM:
 	case OV64A40_HDR_MODE_2EXP_DCG:
+		/*
+		 * Hidden from the menu unless experimental_hdr is set; checked
+		 * again here so that the rejection is visible in the log.
+		 */
+		if (!experimental_hdr) {
+			dev_warn(ov64a40->dev,
+				 "%s HDR does not produce frames yet; load with experimental_hdr=1 to try it\n",
+				 ov64a40_hdr_mode_menu[ov64a40->hdr_mode->val]);
+			return -EOPNOTSUPP;
+		}
+		dev_warn(ov64a40->dev, "%s HDR is experimental\n",
+			 ov64a40_hdr_mode_menu[ov64a40->hdr_mode->val]);
 		return 0;
 
 	case OV64A40_HDR_MODE_3EXP:
@@ -3058,8 +3083,8 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 	if (!ov64a40->hdr_active) {
 		/*
 		 * Clear all HDR enable bits. four_cell_en (bit 2 of 0x3823)
-		 * is left at its power-on default since it reflects the
-		 * physical pixel layout rather than an active HDR mode.
+		 * is left as programmed by the init list, which is what the
+		 * non-HDR modes have been validated with.
 		 */
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
@@ -3087,6 +3112,7 @@ static int ov64a40_program_hdr(struct ov64a40 *ov64a40)
 				OV64A40_TIMING_CTRL_23_FOUR_CELL_EN, &ret);
 		break;
 
+	/* Experimental modes, see ov64a40_validate_hdr_mode(). */
 	case OV64A40_HDR_MODE_2EXP_LM:
 		cci_update_bits(ov64a40->cci, OV64A40_REG_TIMING_CTRL_20,
 				OV64A40_TIMING_CTRL_20_HDR_3EXPO_EN, 0, &ret);
@@ -3675,24 +3701,32 @@ static int ov64a40_init_controls(struct ov64a40 *ov64a40)
 	 * boolean is the master switch (compatible with rpicam-apps' existing
 	 * --hdr sensor flag and any other libcamera client that consults it).
 	 * The vendor-specific OV64A40 menu selects which sensor HDR mode is
-	 * active when WIDE_DYNAMIC_RANGE is set; default is 2-exp-lm to
-	 * mirror the IMX708 stagger HDR convention.
+	 * active when WIDE_DYNAMIC_RANGE is set. The default is 4-cell, the
+	 * only mode that produces frames; the others are hidden unless the
+	 * experimental_hdr module parameter is set.
 	 */
 	ov64a40->hdr_enable = v4l2_ctrl_new_std(hdlr, &ov64a40_ctrl_ops,
 						V4L2_CID_WIDE_DYNAMIC_RANGE,
 						0, 1, 1, 0);
 
 	{
-		static const struct v4l2_ctrl_config ov64a40_hdr_mode_cfg = {
+		struct v4l2_ctrl_config ov64a40_hdr_mode_cfg = {
 			.ops = &ov64a40_ctrl_ops,
 			.id = V4L2_CID_OV64A40_HDR_MODE,
 			.name = "OV64A40 HDR Mode",
 			.type = V4L2_CTRL_TYPE_MENU,
 			.min = 0,
 			.max = ARRAY_SIZE(ov64a40_hdr_mode_menu) - 1,
-			.def = OV64A40_HDR_MODE_2EXP_LM,
+			.def = OV64A40_HDR_MODE_4CELL,
 			.qmenu = ov64a40_hdr_mode_menu,
 		};
+
+		if (experimental_hdr)
+			dev_warn(ov64a40->dev,
+				 "experimental HDR modes enabled, they do not produce frames yet\n");
+		else
+			ov64a40_hdr_mode_cfg.menu_skip_mask =
+				OV64A40_HDR_MODES_EXPERIMENTAL;
 
 		ov64a40->hdr_mode =
 			v4l2_ctrl_new_custom(hdlr, &ov64a40_hdr_mode_cfg, NULL);
