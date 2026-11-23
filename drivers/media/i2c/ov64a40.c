@@ -191,6 +191,17 @@
 #define OV64A40_REG_POST_PIPE_2			CCI_REG8(0x6802)
 #define OV64A40_POST_PIPE_2_GAIN_APPLY_EN	BIT(3)
 #define OV64A40_POST_PIPE_2_DEFAULT		0x3f
+/* Tone gain apply on, log to linear conversion off. */
+#define OV64A40_POST_PIPE_2_4CELL_HDR		0x3e
+/* [7]: local gamma; init value 0xe7. */
+#define OV64A40_REG_POST_PIPE_3			CCI_REG8(0x6803)
+#define OV64A40_POST_PIPE_3_4CELL_HDR		0x67
+/* [3]: EV gain enable; init value 0xc2. */
+#define OV64A40_REG_RAWGAIN_CTRL		CCI_REG8(0x6b23)
+#define OV64A40_RAWGAIN_CTRL_EV_GAIN_EN		0xca
+/* EV gain, 1.75x around the black level. */
+#define OV64A40_REG_RAWGAIN_EV_GAIN		CCI_REG8(0x6b2a)
+#define OV64A40_RAWGAIN_EV_GAIN_4CELL_HDR	0x1c
 /* Black level blocks of the long (0x40xx) exposure: black line window. */
 #define OV64A40_REG_BLC_L_BL_END		CCI_REG8(0x4016)
 #define OV64A40_REG_BLC_L_CTRL_18		CCI_REG8(0x4018)
@@ -2720,13 +2731,13 @@ static const struct cci_reg_sequence ov64a40_1920x1080[] = {
  * - A PD window height of 0 (0x5066/0x5067) removes the PD payload packets
  *   while frame start/end keep arriving, leaving only image lines on VC0.
  * - The 3-exposure combine (0x6801 = 0x11) merges L, M and S as expected.
- * - The tone gain apply stage (0x6802[3]) uses on-chip tables that are not
- *   initialised and produces tile-shaped artefacts: keep it off.
- * - With the black line window end of the 9248x6944 settings (0x4016 =
- *   0x1f, 0x4018 = 0x07) the black level block never calibrates in this
- *   mode and the raw pedestal (about 191 instead of 64 at 10 bits) reaches
- *   the output. The window of the 4624x3472 mode fixes it. ov64a40_init
- *   rewrites both registers on every stream start.
+ * - Tone mapping: with the tone gain apply stage (0x6802[3]) off, the
+ *   combined output is not compressed into 10 bits and wraps above the
+ *   long exposure's knee. With it on, the local gamma stage (0x6803[7])
+ *   adds tile-shaped artefacts and must be off. Gain apply on, log to
+ *   linear off, local gamma off and an EV gain of 1.75x (0x6b23, 0x6b2a)
+ *   give a monotonic, log-like compressed 10-bit output with the black
+ *   level at 64. The output is not linear in scene radiance.
  *
  * Further 4-cell HDR register writes belong here.
  */
@@ -2737,8 +2748,10 @@ static const struct cci_reg_sequence ov64a40_4cell_hdr_regs[] = {
 	{ OV64A40_REG_PRE_PIPE_TOP_2, OV64A40_PRE_PIPE_TOP_2_4CELL_HDR },
 	{ OV64A40_REG_PD_WIN_HEIGHT, 0 },
 	{ OV64A40_REG_POST_PIPE_1, OV64A40_POST_PIPE_1_COMBINE_3EXP },
-	{ OV64A40_REG_POST_PIPE_2, OV64A40_POST_PIPE_2_DEFAULT &
-				   ~OV64A40_POST_PIPE_2_GAIN_APPLY_EN },
+	{ OV64A40_REG_POST_PIPE_2, OV64A40_POST_PIPE_2_4CELL_HDR },
+	{ OV64A40_REG_POST_PIPE_3, OV64A40_POST_PIPE_3_4CELL_HDR },
+	{ OV64A40_REG_RAWGAIN_CTRL, OV64A40_RAWGAIN_CTRL_EV_GAIN_EN },
+	{ OV64A40_REG_RAWGAIN_EV_GAIN, OV64A40_RAWGAIN_EV_GAIN_4CELL_HDR },
 };
 
 /*
