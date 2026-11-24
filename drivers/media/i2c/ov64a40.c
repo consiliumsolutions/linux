@@ -3139,13 +3139,16 @@ static const struct ov64a40_mode ov64a40_4cell_hdr_mode = {
 	},
 	.analogue_crop = {
 		.left = 0,
-		.top = 0,
+		.top = 1,
 		.width = 9280,
 		.height = 6976,
 	},
 	/*
 	 * Measured: with the 9248x6944 vertical offset of 16 (0x3813 = 0x10)
-	 * only 3462 lines are output; an offset of 0 gives all 3472.
+	 * only 3462 lines are output. With an offset of 0 all 3472 lines are
+	 * output but the colour pattern starts one row late compared to the
+	 * other modes (green sites on the other diagonal). An offset of 1
+	 * still gives 3472 lines and the same Bayer order as the plain modes.
 	 */
 	.digital_crop = {
 		.left = 17,
