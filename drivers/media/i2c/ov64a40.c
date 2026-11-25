@@ -188,6 +188,11 @@
 /* [6:4]: combine option. */
 #define OV64A40_REG_POST_PIPE_1			CCI_REG8(0x6801)
 #define OV64A40_POST_PIPE_1_COMBINE_3EXP	0x11
+#define OV64A40_POST_PIPE_1_COMBINE_LS		0x31
+#define OV64A40_REG_POST_PIPE_4			CCI_REG8(0x6804)
+#define OV64A40_POST_PIPE_4_MANUAL_CFA		BIT(1)
+#define OV64A40_REG_TIMING_CTRL_3F		CCI_REG8(0x383f)
+#define OV64A40_TIMING_CTRL_3F_HDR_121_MODE	BIT(0)
 #define OV64A40_REG_POST_PIPE_2			CCI_REG8(0x6802)
 #define OV64A40_POST_PIPE_2_GAIN_APPLY_EN	BIT(3)
 #define OV64A40_POST_PIPE_2_DEFAULT		0x3f
@@ -250,6 +255,20 @@
  * V4L2_CID_EXPOSURE; the medium and short are derived automatically.
  */
 #define OV64A40_HDR_EXPOSURE_RATIO	4
+
+/*
+ * 4-cell HDR exposures, see ov64a40_program_hdr_exposures(). The on-chip
+ * long + short combine scales the short exposure by a fixed factor: a
+ * long / short ratio of 8 gives a continuous output (measured: 16 leaves
+ * a dip where the short exposure takes over, 4 a step up), and the output
+ * curve above the long exposure's clip level moves with the ratio. The
+ * short exposure is therefore a multiple of 12 rows and the long exposure
+ * 8 times that, so the long exposure moves in steps of 96 rows.
+ */
+#define OV64A40_4CELL_EXPOSURE_STEP		12
+#define OV64A40_4CELL_EXPOSURE_RATIO		8
+#define OV64A40_4CELL_VFLIP_LONG_OFFSET		28
+#define OV64A40_4CELL_VFLIP_SHORT_OFFSET	4
 
 /*
  * Vendor menu control for selecting which sensor HDR mode is active when
@@ -2730,7 +2749,18 @@ static const struct cci_reg_sequence ov64a40_1920x1080[] = {
  *   clear, the sensor stops streaming with it set.
  * - A PD window height of 0 (0x5066/0x5067) removes the PD payload packets
  *   while frame start/end keep arriving, leaving only image lines on VC0.
- * - The 3-exposure combine (0x6801 = 0x11) merges L, M and S as expected.
+ * - hdr_3expo_121_mode (0x383f[0], cleared by the init list) must be set:
+ *   without it two exposure pipes carry the long exposure and the third a
+ *   mix of long and short.
+ * - Each 2x2 cell then has three pixels with the long exposure and one
+ *   with the short exposure; the medium exposure register has no effect.
+ *   The long + short combine (0x6801 = 0x31) merges them into an output
+ *   that keeps rising above the long exposure's clip level. The
+ *   3-exposure combine (0x11) expects a medium exposure and saturates
+ *   just above that level.
+ * - The post pipe's manual CFA pattern enable (0x6804[1]) makes the tone
+ *   mapping curve the same for all flips. Without it the curve is up to
+ *   7% lower with the vertical flip set.
  * - Tone mapping: with the tone gain apply stage (0x6802[3]) off, the
  *   combined output is not compressed into 10 bits and wraps above the
  *   long exposure's knee. With it on, the local gamma stage (0x6803[7])
@@ -2747,7 +2777,9 @@ static const struct cci_reg_sequence ov64a40_4cell_hdr_regs[] = {
 	{ OV64A40_REG_MIPI_VC_SEL_PD, OV64A40_MIPI_VC_SEL_PD_VC0 },
 	{ OV64A40_REG_PRE_PIPE_TOP_2, OV64A40_PRE_PIPE_TOP_2_4CELL_HDR },
 	{ OV64A40_REG_PD_WIN_HEIGHT, 0 },
-	{ OV64A40_REG_POST_PIPE_1, OV64A40_POST_PIPE_1_COMBINE_3EXP },
+	{ OV64A40_REG_TIMING_CTRL_3F, OV64A40_TIMING_CTRL_3F_HDR_121_MODE },
+	{ OV64A40_REG_POST_PIPE_1, OV64A40_POST_PIPE_1_COMBINE_LS },
+	{ OV64A40_REG_POST_PIPE_4, OV64A40_POST_PIPE_4_MANUAL_CFA },
 	{ OV64A40_REG_POST_PIPE_2, OV64A40_POST_PIPE_2_4CELL_HDR },
 	{ OV64A40_REG_POST_PIPE_3, OV64A40_POST_PIPE_3_4CELL_HDR },
 	{ OV64A40_REG_RAWGAIN_CTRL, OV64A40_RAWGAIN_CTRL_EV_GAIN_EN },
@@ -3139,16 +3171,16 @@ static const struct ov64a40_mode ov64a40_4cell_hdr_mode = {
 	},
 	.analogue_crop = {
 		.left = 0,
-		.top = 1,
+		.top = 0,
 		.width = 9280,
 		.height = 6976,
 	},
 	/*
-	 * Measured: with the 9248x6944 vertical offset of 16 (0x3813 = 0x10)
-	 * only 3462 lines are output. With an offset of 0 all 3472 lines are
-	 * output but the colour pattern starts one row late compared to the
-	 * other modes (green sites on the other diagonal). An offset of 1
-	 * still gives 3472 lines and the same Bayer order as the plain modes.
+	 * Measured: the analogue crop must start on an even row. From an odd
+	 * row the exposure pipes are fed with pixels of two neighbouring
+	 * cells. With the 9248x6944 vertical offset of 16 (0x3813 = 0x10)
+	 * only 3462 lines are output, with 0 or 1 all 3472. See
+	 * ov64a40_program_geometry() for the Bayer order.
 	 */
 	.digital_crop = {
 		.left = 17,
@@ -3420,8 +3452,16 @@ static int ov64a40_program_geometry(struct ov64a40 *ov64a40)
 	/* ISP windowing. */
 	cci_write(ov64a40->cci, OV64A40_REG_TIMING_CTRL10,
 		  digicrop->left, &ret);
+	/*
+	 * 4-cell HDR, measured against the plain modes for all four flip
+	 * combinations: with the vertical flip set the colour pattern of the
+	 * output starts one row late. Skip that row to keep the Bayer order
+	 * of the media bus code.
+	 */
 	cci_write(ov64a40->cci, OV64A40_REG_TIMING_CTRL12,
-		  digicrop->top, &ret);
+		  digicrop->top +
+		  (mode == &ov64a40_4cell_hdr_mode && ov64a40->vflip->val),
+		  &ret);
 	cci_write(ov64a40->cci, OV64A40_REG_TIMING_CTRL8,
 		  digicrop->width, &ret);
 	cci_write(ov64a40->cci, OV64A40_REG_TIMING_CTRLA,
@@ -3659,7 +3699,7 @@ static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exposure)
 		{ OV64A40_REG_MEC_SHORT_EXPO, 0 },
 	};
 	unsigned int num_regs = ARRAY_SIZE(regs);
-	int exp_long, exp_med;
+	int exp_long, exp_med, exp_short = 0;
 
 	if (ov64a40_stagger_active(ov64a40)) {
 		exp_long = rounddown(exposure / OV64A40_STAGGER_ROW_LINES,
@@ -3669,15 +3709,39 @@ static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exposure)
 				    OV64A40_STAGGER_EXPOSURE_STEP);
 		num_regs = 2;
 	} else {
-		exp_long = exposure;
-		exp_med = exp_long / OV64A40_HDR_EXPOSURE_RATIO;
+		/*
+		 * 4-cell HDR, measured on hardware by outputting each
+		 * exposure pipe alone (0x6800): the exposures are read in a
+		 * rotation of OV64A40_4CELL_EXPOSURE_STEP rows. The long
+		 * exposure must be a multiple of it, or the pipes swap
+		 * exposures. The pixels of the medium exposure are exposed
+		 * with the long exposure whatever 0x3540 holds, so it is
+		 * written equal to the long one.
+		 */
+		exp_short = max(exposure / (OV64A40_4CELL_EXPOSURE_STEP *
+					    OV64A40_4CELL_EXPOSURE_RATIO), 1) *
+			    OV64A40_4CELL_EXPOSURE_STEP;
+		exp_long = exp_short * OV64A40_4CELL_EXPOSURE_RATIO;
+		/*
+		 * With the vertical flip set, both need a remainder of 4
+		 * rows to reach the same pipes as without it. 28 rows on
+		 * the long exposure keep the ratio within 3% of 8.
+		 */
+		if (ov64a40->vflip->val) {
+			exp_long += OV64A40_4CELL_VFLIP_LONG_OFFSET;
+			exp_short += OV64A40_4CELL_VFLIP_SHORT_OFFSET;
+		}
+		exp_med = exp_long;
 	}
 	exp_med = max(exp_med, OV64A40_EXPOSURE_MIN);
 
 	regs[0].val = exp_long;
 	regs[1].val = exp_med;
-	regs[2].val = max(exp_med / OV64A40_HDR_EXPOSURE_RATIO,
-			  OV64A40_EXPOSURE_MIN);
+	if (ov64a40_stagger_active(ov64a40))
+		regs[2].val = max(exp_med / OV64A40_HDR_EXPOSURE_RATIO,
+				  OV64A40_EXPOSURE_MIN);
+	else
+		regs[2].val = exp_short;
 
 	return ov64a40_write_hdr_group(ov64a40, OV64A40_GROUP_HDR_EXPOSURE,
 				       regs, num_regs);
