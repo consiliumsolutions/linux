@@ -262,13 +262,12 @@
  * long / short ratio of 8 gives a continuous output (measured: 16 leaves
  * a dip where the short exposure takes over, 4 a step up), and the output
  * curve above the long exposure's clip level moves with the ratio. The
- * short exposure is therefore a multiple of 12 rows and the long exposure
- * 8 times that, so the long exposure moves in steps of 96 rows.
+ * short and long exposure are therefore chosen together, see
+ * ov64a40_4cell_exposures().
  */
 #define OV64A40_4CELL_EXPOSURE_STEP		12
 #define OV64A40_4CELL_EXPOSURE_RATIO		8
-#define OV64A40_4CELL_VFLIP_LONG_OFFSET		28
-#define OV64A40_4CELL_VFLIP_SHORT_OFFSET	4
+#define OV64A40_4CELL_VFLIP_OFFSET		4
 
 /*
  * Vendor menu control for selecting which sensor HDR mode is active when
@@ -3683,6 +3682,43 @@ static bool ov64a40_stagger_active(struct ov64a40 *ov64a40)
 }
 
 /*
+ * 4-cell HDR long and short exposure for a requested long exposure.
+ *
+ * Both must sit on the sensor's 12-row rotation: multiples of 12 rows, plus
+ * 4 rows with the vertical flip set. The short exposure is the candidate
+ * closest to an eighth of the request; the long exposure is the one closest
+ * to the request that keeps the ratio between 7.5 and 8.5, as the on-chip
+ * combine scales the short exposure by a fixed factor. With the vertical
+ * flip set, the 4 row remainder alone gives one more, shorter state: a short
+ * exposure of 4 rows with a long exposure of 28 rows.
+ */
+static void ov64a40_4cell_exposures(int exposure, bool vflip,
+				    int *exp_long, int *exp_short)
+{
+	const int step = OV64A40_4CELL_EXPOSURE_STEP;
+	const int ratio = OV64A40_4CELL_EXPOSURE_RATIO;
+	const int off = vflip ? OV64A40_4CELL_VFLIP_OFFSET : 0;
+	int m, lo, hi, l;
+
+	/* Short exposure: step * m + off closest to exposure / ratio. */
+	m = DIV_ROUND_CLOSEST(max(exposure - ratio * off, 0), ratio * step);
+	if (m == 0 && (!vflip || exposure * 2 > (28 + step * ratio + 28))) {
+		m = 1;
+	} else if (m == 0) {
+		*exp_short = off;
+		*exp_long = 28;
+		return;
+	}
+	*exp_short = step * m + off;
+
+	/* Long exposure candidates within ratio 7.5 .. 8.5. */
+	lo = roundup(*exp_short * 15 / 2 - off, step) + off;
+	hi = rounddown(*exp_short * 17 / 2 - off, step) + off;
+	l = DIV_ROUND_CLOSEST(max(exposure - off, 0), step) * step + off;
+	*exp_long = clamp(l, lo, hi);
+}
+
+/*
  * Program the HDR exposures. The medium/short values are derived from the
  * long via OV64A40_HDR_EXPOSURE_RATIO and clamped to the sensor minimum.
  *
@@ -3718,19 +3754,8 @@ static int ov64a40_program_hdr_exposures(struct ov64a40 *ov64a40, int exposure)
 		 * with the long exposure whatever 0x3540 holds, so it is
 		 * written equal to the long one.
 		 */
-		exp_short = max(exposure / (OV64A40_4CELL_EXPOSURE_STEP *
-					    OV64A40_4CELL_EXPOSURE_RATIO), 1) *
-			    OV64A40_4CELL_EXPOSURE_STEP;
-		exp_long = exp_short * OV64A40_4CELL_EXPOSURE_RATIO;
-		/*
-		 * With the vertical flip set, both need a remainder of 4
-		 * rows to reach the same pipes as without it. 28 rows on
-		 * the long exposure keep the ratio within 3% of 8.
-		 */
-		if (ov64a40->vflip->val) {
-			exp_long += OV64A40_4CELL_VFLIP_LONG_OFFSET;
-			exp_short += OV64A40_4CELL_VFLIP_SHORT_OFFSET;
-		}
+		ov64a40_4cell_exposures(exposure, ov64a40->vflip->val,
+					&exp_long, &exp_short);
 		exp_med = exp_long;
 	}
 	exp_med = max(exp_med, OV64A40_EXPOSURE_MIN);
